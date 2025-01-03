@@ -159,7 +159,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.await?;
 	Command::new("git")
 		.current_dir(&tmp)
-		.args("commit -a --amend --message wip".split(' '))
+		.args("commit -a --message wip".split(' '))
 		.spawn()?
 		.wait()
 		.await?;
