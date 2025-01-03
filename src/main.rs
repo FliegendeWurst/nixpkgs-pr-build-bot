@@ -153,7 +153,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.await?;
 	Command::new("git")
 		.current_dir(&tmp)
-		.args(["checkout", &rev, "--", "."])
+		.args(["restore", "-s", &rev, "--", "."])
 		.spawn()?
 		.wait()
 		.await?;
