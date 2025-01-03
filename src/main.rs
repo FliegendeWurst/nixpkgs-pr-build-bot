@@ -113,14 +113,6 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	drop(prs);
 	reply!(msg, format!("⏳ PR {num}, fetching ..."));
 
-	let tmp = format!("/tmp/nixpkgs-{num}");
-	Command::new("git")
-		.current_dir("/home/arne/nixpkgs-wt-2")
-		.args(["worktree", "add", &tmp])
-		.spawn()?
-		.wait()
-		.await?;
-
 	let rev = String::from_utf8(
 		Command::new("jj")
 			.current_dir("/home/arne/nixpkgs-wt-2")
@@ -132,6 +124,14 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 			.stdout,
 	)
 	.unwrap();
+
+	let tmp = format!("/tmp/nixpkgs-{num}");
+	Command::new("git")
+		.current_dir("/home/arne/nixpkgs-wt-2")
+		.args(["worktree", "add", &tmp, &format!("{rev}~")])
+		.spawn()?
+		.wait()
+		.await?;
 
 	Command::new("git")
 		.current_dir(&tmp)
@@ -147,7 +147,19 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.await?;
 	Command::new("git")
 		.current_dir(&tmp)
-		.args(["checkout", &rev])
+		.args(["switch", "-c", &format!("nixpkgs-{num}")])
+		.spawn()?
+		.wait()
+		.await?;
+	Command::new("git")
+		.current_dir(&tmp)
+		.args(["checkout", &rev, "--", "."])
+		.spawn()?
+		.wait()
+		.await?;
+	Command::new("git")
+		.current_dir(&tmp)
+		.args("commit -a --amend --message wip".split(' '))
 		.spawn()?
 		.wait()
 		.await?;
