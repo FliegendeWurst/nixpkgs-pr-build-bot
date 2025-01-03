@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.95"
 frankenstein = { version = "0.37.0", default-features = false, features = ["async-http-client", "async-telegram-trait"] }
 once_cell = "1.20.2"
 reqwest = { version = "0.12.12", default-features = false, features = ["json"] }

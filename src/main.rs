@@ -1,3 +1,5 @@
+#![feature(round_char_boundary)]
+
 use std::{collections::HashSet, env, error::Error, process::Stdio, sync::Arc};
 
 use frankenstein::{AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent};
@@ -55,8 +57,17 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 						"/pr" => {
 							let api = Arc::clone(&api);
 							task::spawn(async move {
-								if let Err(e) = process_pr(api, message, args).await {
+								let id = message.chat.id;
+								if let Err(e) = process_pr(Arc::clone(&api), message, args).await {
 									println!("error: {:?}", e);
+									let _ = api
+										.send_message(
+											&SendMessageParams::builder()
+												.chat_id(id)
+												.text(format!("🤯 Internal error: {e:?}"))
+												.build(),
+										)
+										.await;
 								}
 							});
 						},
@@ -70,7 +81,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	}
 }
 
-async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<(), Box<dyn Error>> {
+async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<(), anyhow::Error> {
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
 			api.send_message(
@@ -124,7 +135,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 
 	Command::new("git")
 		.current_dir(&tmp)
-		.args(["fetch", "origin", "master"])
+		.args(["fetch", "origin", "master", "staging", "staging-next"])
 		.spawn()?
 		.wait()
 		.await?;
@@ -142,22 +153,29 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.await?;
 	let output = Command::new("git")
 		.current_dir(&tmp)
-		.args("log --oneline FETCH_HEAD --not origin/master".split(' '))
+		.args("log --oneline FETCH_HEAD --not origin/master origin/staging origin/staging-next".split(' '))
 		.stdout(Stdio::piped())
 		.spawn()?
 		.wait_with_output()
 		.await?;
 	let out = String::from_utf8(output.stdout)?;
+	println!("PR {num}, changes:\n{out}");
 	reply!(msg, format!("⏳ PR {num}, changes:\n{out}"));
 	let lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
+	let mut doit = true;
 	for line in &lines {
 		let id = line.split_once(' ').unwrap().0;
-		Command::new("git")
+		let cp = Command::new("git")
 			.current_dir(&tmp)
 			.args(format!("cherry-pick -x {id}").split(' '))
 			.spawn()?
 			.wait()
 			.await?;
+		if !cp.success() {
+			reply!(msg, format!("😢 PR {num}, cherry-pick of {id} failed"));
+			doit = false;
+			break;
+		}
 	}
 
 	for line in &lines {
@@ -167,65 +185,76 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		let Some((pkg, _)) = line.split_once(' ').map(|x| x.1.split_once(": ")).flatten() else {
 			continue;
 		};
-		if pkg.starts_with("nixos") || pkg.starts_with('-') || pkg.contains(' ') {
+		if pkg.starts_with("nixos") || pkg.starts_with('-') || pkg.contains(' ') || pkg.starts_with("maintainers") {
 			continue;
 		}
 		pkgs.push(pkg);
 	}
 
+	pkgs.sort();
+	pkgs.dedup();
 	let pkgs_to_build = pkgs.join(" ");
-	reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
+	println!("PR {num}, building: {pkgs_to_build}");
+	if doit {
+		reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
 
-	let mut nix_args = vec![
-		"--run".to_owned(),
-		"exit".to_owned(),
-		"-k".to_owned(),
-		"-j6".to_owned(),
-		"-I".to_owned(),
-		format!("nixpkgs={tmp}"),
-		"-p".to_owned(),
-	];
-	for x in pkgs {
-		nix_args.push(x.to_owned());
-	}
-	let nix_output = Command::new("nix-shell")
-		.current_dir(&tmp)
-		.args(nix_args)
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()?
-		.wait_with_output()
-		.await?;
-	if nix_output.status.success() {
-		reply!(msg, format!("✅ PR {num}, built successfully"));
-	} else {
-		let stdout = String::from_utf8_lossy(&nix_output.stderr);
-		if stdout.len() < 3000 {
-			reply!(msg, format!("💥 PR {num}, build failed"));
-			reply!(msg, format!("```\n{stdout}```"));
+		let mut nix_args = vec![
+			"--run".to_owned(),
+			"exit".to_owned(),
+			"-k".to_owned(),
+			"-j6".to_owned(),
+			"-I".to_owned(),
+			format!("nixpkgs={tmp}"),
+			"-p".to_owned(),
+		];
+		for x in pkgs {
+			nix_args.push(x.to_owned());
+		}
+		let nix_output = Command::new("nix-shell")
+			.current_dir(&tmp)
+			.args(nix_args)
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()?
+			.wait_with_output()
+			.await?;
+		if nix_output.status.success() {
+			reply!(msg, format!("✅ PR {num}, built successfully"));
 		} else {
-			let map = serde_json::json!({
-				"text": stdout.as_ref(),
-				"extension": "log",
-				"expires": 7 * 24 * 60 * 60
-			});
+			let stdout = String::from_utf8_lossy(&nix_output.stderr);
+			if stdout.len() < 1000 {
+				reply!(msg, format!("💥 PR {num}, build failed"));
+				reply!(msg, stdout);
+			} else {
+				let mut text = stdout.as_ref();
+				if text.len() >= 5 * 1000 * 1000 {
+					// truncate
+					text = &text[text.ceil_char_boundary(text.len() - 5 * 1000 * 1000)..];
+				}
+				let map = serde_json::json!({
+					"text": text,
+					"extension": "log",
+					"expires": 7 * 24 * 60 * 60
+				});
 
-			let client = reqwest::Client::new();
-			let res = client
-				.post("https://paste.fliegendewurst.eu/")
-				.json(&map)
-				.send()
-				.await?;
-			let res: serde_json::Value = res.json().await?;
-			reply!(
-				msg,
-				format!(
-					"💥 PR {num}, build failed\n👉 Full log: https://paste.fliegendewurst.eu{}",
-					res.get("path").unwrap().as_str().unwrap()
-				)
-			);
+				let client = reqwest::Client::new();
+				let res = client
+					.post("https://paste.fliegendewurst.eu/")
+					.json(&map)
+					.send()
+					.await?;
+				let res: serde_json::Value = res.json().await?;
+				reply!(
+					msg,
+					format!(
+						"💥 PR {num}, build failed\n👉 Full log: https://paste.fliegendewurst.eu{}",
+						res.get("path").unwrap().as_str().unwrap()
+					)
+				);
+			}
 		}
 	}
+
 	Command::new("git")
 		.current_dir("/home/arne/nixpkgs-wt-2")
 		.args(["worktree", "remove", "--force", &tmp])
