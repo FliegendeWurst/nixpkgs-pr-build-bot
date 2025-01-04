@@ -1,10 +1,11 @@
 #![feature(round_char_boundary)]
 
-use std::{collections::HashSet, env, error::Error, process::Stdio, sync::Arc};
+use std::{collections::HashSet, env, error::Error, process::Stdio, sync::Arc, time::SystemTime};
 
 use frankenstein::{AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent};
 use once_cell::sync::Lazy;
 use tokio::{
+	fs,
 	process::Command,
 	sync::{Mutex, Semaphore},
 	task,
@@ -12,6 +13,7 @@ use tokio::{
 
 static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(10));
 static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[tokio::main]
 async fn main() {
@@ -44,36 +46,39 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 			// If the received update contains a new message...
 			if let UpdateContent::Message(message) = update.content {
 				if let Some(data) = &message.text {
-					let Some((command, args)) = data.split_once(' ') else {
-						reply!(message, format!("error: message not conformant to command syntax"));
-						continue;
-					};
-					let args = args.to_owned();
+					for data in data.split('\n') {
+						let Some((command, args)) = data.split_once(' ') else {
+							reply!(message, format!("error: message not conformant to command syntax"));
+							continue;
+						};
+						let args = args.to_owned();
 
-					// Print received text message to stdout.
-					// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
+						// Print received text message to stdout.
+						// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
 
-					match command {
-						"/pr" => {
-							let api = Arc::clone(&api);
-							task::spawn(async move {
-								let id = message.chat.id;
-								if let Err(e) = process_pr(Arc::clone(&api), message, args).await {
-									println!("error: {:?}", e);
-									let _ = api
-										.send_message(
-											&SendMessageParams::builder()
-												.chat_id(id)
-												.text(format!("🤯 Internal error: {e:?}"))
-												.build(),
-										)
-										.await;
-								}
-							});
-						},
-						_ => {
-							reply!(message, format!("error: unknown command"));
-						},
+						match command {
+							"/pr" => {
+								let api = Arc::clone(&api);
+								let message = message.clone();
+								task::spawn(async move {
+									let id = message.chat.id;
+									if let Err(e) = process_pr(Arc::clone(&api), message, args).await {
+										println!("error: {:?}", e);
+										let _ = api
+											.send_message(
+												&SendMessageParams::builder()
+													.chat_id(id)
+													.text(format!("🤯 Internal error: {e:?}"))
+													.build(),
+											)
+											.await;
+									}
+								});
+							},
+							_ => {
+								reply!(message, format!("error: unknown command"));
+							},
+						}
 					}
 				}
 			}
@@ -113,6 +118,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	drop(prs);
 	reply!(msg, format!("⏳ PR {num}, fetching ..."));
 
+	let git_operations = GIT_OPERATIONS.lock().await;
 	let rev = String::from_utf8(
 		Command::new("jj")
 			.current_dir("/home/arne/nixpkgs-wt-2")
@@ -157,6 +163,23 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.spawn()?
 		.wait()
 		.await?;
+	fs::write(
+		format!("{tmp}/jujutsu_hack.txt"),
+		format!(
+			"dummy {num} {}",
+			SystemTime::now()
+				.duration_since(SystemTime::UNIX_EPOCH)
+				.unwrap()
+				.as_secs()
+		),
+	)
+	.await?;
+	Command::new("git")
+		.current_dir(&tmp)
+		.args("add .".split(' '))
+		.spawn()?
+		.wait()
+		.await?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("commit -a --message wip".split(' '))
@@ -189,6 +212,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 			break;
 		}
 	}
+	drop(git_operations);
 
 	for line in &lines {
 		if line.is_empty() {
@@ -267,18 +291,20 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		}
 	}
 
+	let git_operations = GIT_OPERATIONS.lock().await;
 	Command::new("git")
 		.current_dir("/home/arne/nixpkgs-wt-2")
 		.args(["worktree", "remove", "--force", &tmp])
 		.spawn()?
 		.wait()
 		.await?;
-	Command::new("git")
-		.current_dir("/home/arne/nixpkgs-wt-2")
-		.args(["branch", "-D", &format!("nixpkgs-{num}")])
-		.spawn()?
-		.wait()
-		.await?;
+	//Command::new("git")
+	//	.current_dir("/home/arne/nixpkgs-wt-2")
+	//	.args(["branch", "-D", &format!("nixpkgs-{num}")])
+	//	.spawn()?
+	//	.wait()
+	//	.await?;
+	drop(git_operations);
 
 	let mut prs = PRS_RUNNING.lock().await;
 	prs.remove(&num);
