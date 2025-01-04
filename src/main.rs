@@ -105,7 +105,10 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	};
 	let (num, mut pkgs) = if args.contains(' ') {
 		let (num, pkgs) = args.split_once(' ').unwrap();
-		(num.parse().unwrap_or(0), pkgs.split_whitespace().collect())
+		(
+			num.parse().unwrap_or(0),
+			pkgs.split_whitespace().map(|x| x.to_owned()).collect(),
+		)
 	} else {
 		(args.parse().unwrap_or(0), vec![])
 	};
@@ -153,7 +156,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.await?;
 	Command::new("git")
 		.current_dir(&tmp)
-		.args(["switch", "-c", &format!("nixpkgs-{num}")])
+		.args(["switch", "-C", &format!("nixpkgs-{num}")])
 		.spawn()?
 		.wait()
 		.await?;
@@ -202,12 +205,23 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		let id = line.split_once(' ').unwrap().0;
 		let cp = Command::new("git")
 			.current_dir(&tmp)
-			.args(format!("cherry-pick -x {id}").split(' '))
+			.args(format!("cherry-pick --allow-empty -x {id}").split(' '))
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
 			.spawn()?
-			.wait()
+			.wait_with_output()
 			.await?;
-		if !cp.success() {
-			reply!(msg, format!("😢 PR {num}, cherry-pick of {id} failed"));
+		let output = String::from_utf8_lossy(&cp.stdout);
+		let output_err = String::from_utf8_lossy(&cp.stderr);
+		if !cp.status.success() && !output_err.contains("--allow-empty") {
+			let url = paste(&format!(
+				"git cherry-pick standard output:\n{output}\ngit cherry-pick standard error:\n{output_err}"
+			))
+			.await?;
+			reply!(
+				msg,
+				format!("😢 PR {num}, cherry-pick of {id} failed\n👉 Conflict: {url}")
+			);
 			doit = false;
 			break;
 		}
@@ -224,7 +238,13 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		if pkg.starts_with("nixos") || pkg.starts_with('-') || pkg.contains(' ') || pkg.starts_with("maintainers") {
 			continue;
 		}
-		pkgs.push(pkg);
+		if pkg.contains('{') {
+			for pkg in brace_expand::brace_expand(pkg) {
+				pkgs.push(pkg);
+			}
+		} else {
+			pkgs.push(pkg.to_owned());
+		}
 	}
 
 	pkgs.sort();
@@ -262,31 +282,9 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 				reply!(msg, format!("💥 PR {num}, build failed"));
 				reply!(msg, stdout);
 			} else {
-				let mut text = stdout.as_ref();
-				if text.len() >= 5 * 1000 * 1000 {
-					// truncate
-					text = &text[text.ceil_char_boundary(text.len() - 5 * 1000 * 1000)..];
-				}
-				let map = serde_json::json!({
-					"text": text,
-					"extension": "log",
-					"expires": 7 * 24 * 60 * 60
-				});
-
-				let client = reqwest::Client::new();
-				let res = client
-					.post("https://paste.fliegendewurst.eu/")
-					.json(&map)
-					.send()
-					.await?;
-				let res: serde_json::Value = res.json().await?;
-				reply!(
-					msg,
-					format!(
-						"💥 PR {num}, build failed\n👉 Full log: https://paste.fliegendewurst.eu{}",
-						res.get("path").unwrap().as_str().unwrap()
-					)
-				);
+				let text = stdout.as_ref();
+				let url = paste(text).await?;
+				reply!(msg, format!("💥 PR {num}, build failed\n👉 Full log: {url}",));
 			}
 		}
 	}
@@ -313,4 +311,28 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	drop(ticket);
 
 	Ok(())
+}
+
+async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
+	if text.len() >= 5 * 1000 * 1000 {
+		// truncate
+		text = &text[text.ceil_char_boundary(text.len() - 5 * 1000 * 1000)..];
+	}
+	let map = serde_json::json!({
+		"text": text,
+		"extension": "log",
+		"expires": 7 * 24 * 60 * 60
+	});
+
+	let client = reqwest::Client::new();
+	let res = client
+		.post("https://paste.fliegendewurst.eu/")
+		.json(&map)
+		.send()
+		.await?;
+	let res: serde_json::Value = res.json().await?;
+	Ok(format!(
+		"https://paste.fliegendewurst.eu{}",
+		res.get("path").unwrap().as_str().unwrap()
+	))
 }
