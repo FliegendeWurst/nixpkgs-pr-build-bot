@@ -1,6 +1,13 @@
-#![feature(round_char_boundary)]
+#![feature(round_char_boundary, iter_map_windows)]
 
-use std::{collections::HashSet, env, error::Error, process::Stdio, sync::Arc, time::SystemTime};
+use std::{
+	collections::{HashMap, HashSet},
+	env,
+	error::Error,
+	process::Stdio,
+	sync::Arc,
+	time::{Duration, SystemTime},
+};
 
 use frankenstein::{AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent};
 use once_cell::sync::Lazy;
@@ -13,6 +20,7 @@ use tokio::{
 
 static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(10));
 static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static PRS_BUILDING: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[tokio::main]
@@ -40,17 +48,28 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	// Fetch new updates via long poll method
 	let mut update_params = GetUpdatesParams::builder().build();
 	loop {
-		let stream = api.get_updates(&update_params).await?;
+		let stream = api.get_updates(&update_params).await;
+		if let Err(e) = stream {
+			eprintln!("telegram error: {e:?}");
+			tokio::time::sleep(Duration::from_secs(10)).await;
+			continue;
+		}
+		let stream = stream.unwrap();
 		for update in stream.result {
 			update_params.offset = Some(i64::from(update.update_id) + 1);
 			// If the received update contains a new message...
 			if let UpdateContent::Message(message) = update.content {
 				if let Some(data) = &message.text {
 					for data in data.split('\n') {
-						let Some((command, args)) = data.split_once(' ') else {
-							reply!(message, format!("error: message not conformant to command syntax"));
-							continue;
-						};
+						let (mut command, mut args) = data.split_once(' ').unwrap_or((data, ""));
+						// reply!(message, format!("error: message not conformant to command syntax"));
+
+						if let Some(pr_num) = command.strip_prefix("https://github.com/NixOS/nixpkgs/pull/") {
+							command = "/pr";
+							let pr_num = pr_num.split(|x: char| !x.is_digit(10)).next().unwrap();
+							args = pr_num;
+						}
+
 						let args = args.to_owned();
 
 						// Print received text message to stdout.
@@ -62,7 +81,16 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 								let message = message.clone();
 								task::spawn(async move {
 									let id = message.chat.id;
-									if let Err(e) = process_pr(Arc::clone(&api), message, args).await {
+									let (num, pkgs) = if args.contains(' ') {
+										let (num, pkgs) = args.split_once(' ').unwrap();
+										(
+											num.parse().unwrap_or(0),
+											pkgs.split_whitespace().map(|x| x.to_owned()).collect(),
+										)
+									} else {
+										(args.parse().unwrap_or(0), vec![])
+									};
+									if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs).await {
 										println!("error: {:?}", e);
 										let _ = api
 											.send_message(
@@ -73,7 +101,24 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 											)
 											.await;
 									}
+									let mut prs = PRS_RUNNING.lock().await;
+									prs.remove(&num);
+									drop(prs);
+									let mut prs_building = PRS_BUILDING.lock().await;
+									prs_building.remove(&num);
+									drop(prs_building);
 								});
+							},
+							"/status" => {
+								let prs_building = PRS_BUILDING.lock().await;
+								let mut status = String::new();
+								for (num, pkgs) in prs_building.iter() {
+									status += &format!("PR {num}: {}", pkgs.join(" "));
+								}
+								if !status.is_empty() {
+									reply!(message, status);
+								}
+								drop(prs_building);
 							},
 							_ => {
 								reply!(message, format!("error: unknown command"));
@@ -86,7 +131,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	}
 }
 
-async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<(), anyhow::Error> {
+async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<String>) -> Result<(), anyhow::Error> {
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
 			api.send_message(
@@ -102,15 +147,6 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	let Ok(ticket) = TASKS_RUNNING.try_acquire() else {
 		reply!(msg, "🤖 too many PRs already running");
 		return Ok(());
-	};
-	let (num, mut pkgs) = if args.contains(' ') {
-		let (num, pkgs) = args.split_once(' ').unwrap();
-		(
-			num.parse().unwrap_or(0),
-			pkgs.split_whitespace().map(|x| x.to_owned()).collect(),
-		)
-	} else {
-		(args.parse().unwrap_or(0), vec![])
 	};
 	let mut prs = PRS_RUNNING.lock().await;
 	if prs.contains(&num) {
@@ -197,9 +233,10 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		.wait_with_output()
 		.await?;
 	let out = String::from_utf8(output.stdout)?;
-	println!("PR {num}, changes:\n{out}");
-	reply!(msg, format!("⏳ PR {num}, changes:\n{out}"));
-	let lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
+	let mut lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
+	lines.reverse();
+	println!("PR {num}, changes:\n{}", lines.join("\n"));
+	reply!(msg, format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
 	let mut doit = true;
 	for line in &lines {
 		let id = line.split_once(' ').unwrap().0;
@@ -214,8 +251,16 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		let output = String::from_utf8_lossy(&cp.stdout);
 		let output_err = String::from_utf8_lossy(&cp.stderr);
 		if !cp.status.success() && !output_err.contains("--allow-empty") {
+			let diff = Command::new("git")
+				.current_dir(&tmp)
+				.args(&["diff"])
+				.stdout(Stdio::piped())
+				.spawn()?
+				.wait_with_output()
+				.await?;
+			let output_diff = String::from_utf8_lossy(&diff.stdout);
 			let url = paste(&format!(
-				"git cherry-pick standard output:\n{output}\ngit cherry-pick standard error:\n{output_err}"
+				"git cherry-pick standard output:\n{output}\ngit cherry-pick standard error:\n{output_err}\ngit diff output:\n{output_diff}"
 			))
 			.await?;
 			reply!(
@@ -235,7 +280,13 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		let Some((pkg, _)) = line.split_once(' ').map(|x| x.1.split_once(": ")).flatten() else {
 			continue;
 		};
-		if pkg.starts_with("nixos") || pkg.starts_with('-') || pkg.contains(' ') || pkg.starts_with("maintainers") {
+		if pkg.starts_with("Revert")
+			|| pkg.starts_with("treewide")
+			|| pkg.starts_with("nixos")
+			|| pkg.starts_with('-')
+			|| pkg.contains(' ')
+			|| pkg.starts_with("maintainers")
+		{
 			continue;
 		}
 		if pkg.contains('{') {
@@ -250,6 +301,9 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	pkgs.sort();
 	pkgs.dedup();
 	let pkgs_to_build = pkgs.join(" ");
+	let mut prs_building = PRS_BUILDING.lock().await;
+	prs_building.insert(num, pkgs.clone());
+	drop(prs_building);
 	println!("PR {num}, building: {pkgs_to_build}");
 	if doit {
 		reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
@@ -268,6 +322,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		}
 		let nix_output = Command::new("nix-shell")
 			.current_dir(&tmp)
+			.env("NIXPKGS_ALLOW_UNFREE", "1")
+			.env("NIXPKGS_ALLOW_INSECURE", "1")
 			.args(nix_args)
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
@@ -277,7 +333,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 		if nix_output.status.success() {
 			reply!(msg, format!("✅ PR {num}, built successfully"));
 		} else {
-			let stdout = String::from_utf8_lossy(&nix_output.stderr);
+			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);
+			let stdout = String::from_utf8_lossy(&stripped);
 			if stdout.len() < 1000 {
 				reply!(msg, format!("💥 PR {num}, build failed"));
 				reply!(msg, stdout);
@@ -304,25 +361,69 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, args: String) -> Result<()
 	//	.await?;
 	drop(git_operations);
 
-	let mut prs = PRS_RUNNING.lock().await;
-	prs.remove(&num);
-	drop(prs);
-
 	drop(ticket);
 
 	Ok(())
 }
 
 async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
+	let mut map = serde_json::json!({
+		"extension": "log",
+		"expires": 7 * 24 * 60 * 60
+	});
+	let mut failures = text
+		.split('\n')
+		.map_windows(|x: &[&str; 26]| {
+			if x[25].contains("For full logs, run") {
+				Some(*x)
+			} else {
+				None
+			}
+		})
+		.flatten()
+		.map(|x| {
+			x.into_iter()
+				.flat_map(|x| {
+					x.strip_prefix("       > ")
+						.or(x.strip_prefix("       For full logs, run "))
+				})
+				.chain(Some("\n"))
+		})
+		.flatten()
+		.map(|x| x.to_owned())
+		.collect::<Vec<_>>();
+	for line_orig in &mut failures {
+		let Some(line) = line_orig.strip_prefix("'nix log ") else {
+			continue;
+		};
+		let Some(line) = line.strip_suffix("'.") else {
+			continue;
+		};
+		let nix_output = Command::new("nix")
+			.current_dir("/tmp")
+			.args(&["log", line])
+			.stdout(Stdio::piped())
+			.spawn()?
+			.wait_with_output()
+			.await?;
+		let stripped = strip_ansi_escapes::strip(&nix_output.stdout);
+		let s = String::from_utf8_lossy(&stripped);
+		let url = Box::pin(paste(&s)).await?;
+		line_orig.pop();
+		*line_orig += ": ";
+		*line_orig += &url;
+	}
 	if text.len() >= 5 * 1000 * 1000 {
 		// truncate
 		text = &text[text.ceil_char_boundary(text.len() - 5 * 1000 * 1000)..];
 	}
-	let map = serde_json::json!({
-		"text": text,
-		"extension": "log",
-		"expires": 7 * 24 * 60 * 60
-	});
+	if !failures.is_empty() {
+		map.as_object_mut()
+			.unwrap()
+			.insert("text".to_owned(), format!("{}\n\n{}", failures.join("\n"), text).into());
+	} else {
+		map.as_object_mut().unwrap().insert("text".to_owned(), text.into());
+	}
 
 	let client = reqwest::Client::new();
 	let res = client
