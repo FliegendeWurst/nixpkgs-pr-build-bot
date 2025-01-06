@@ -297,6 +297,15 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			pkgs.push(pkg.to_owned());
 		}
 	}
+	let to_remove = pkgs
+		.iter()
+		.flat_map(|x| x.strip_prefix('-'))
+		.map(|x| x.to_owned())
+		.collect::<Vec<_>>();
+	for pkg in to_remove {
+		pkgs.remove_item(pkg);
+	}
+	pkgs.retain(|x| !x.starts_with('-'));
 
 	pkgs.sort();
 	pkgs.dedup();
@@ -364,6 +373,18 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	drop(ticket);
 
 	Ok(())
+}
+
+pub trait VecRemoveItem<T, U> {
+	fn remove_item(&mut self, item: U) -> Option<T>
+	where
+		T: PartialEq<U>;
+}
+
+impl<T: PartialEq<U>, U> VecRemoveItem<T, U> for Vec<T> {
+	fn remove_item(&mut self, item: U) -> Option<T> {
+		self.iter().position(|n| n == &item).map(|idx| self.remove(idx))
+	}
 }
 
 async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
