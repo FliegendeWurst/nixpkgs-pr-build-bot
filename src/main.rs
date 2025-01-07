@@ -16,6 +16,7 @@ use frankenstein::{
 use once_cell::sync::Lazy;
 use tokio::{
 	fs,
+	io::AsyncWriteExt,
 	process::Command,
 	sync::{Mutex, Semaphore},
 	task,
@@ -26,6 +27,17 @@ static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet:
 static PRS_BUILDING: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+static NIX_USER: Lazy<String> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_NIX_USER").unwrap_or("nobody".to_owned()));
+static SUDO_PASSWORD: Lazy<String> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_SUDO_PASSWORD").expect(
+		"NIXPKGS_PR_BUILD_BOT_SUDO_PASSWORD not set to password required to sudo as $NIXPKGS_PR_BUILD_BOT_NIX_USER (nobody)",
+	)
+});
+static NIXPKGS_DIRECTORY: Lazy<String> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_NIXPKGS_DIRECTORY")
+		.expect("NIXPKGS_PR_BUILD_BOT_NIXPKGS_DIRECTORY not set to jj-colocated checkout of nixpkgs")
+});
+
 #[tokio::main]
 async fn main() {
 	real_main().await.unwrap();
@@ -33,6 +45,9 @@ async fn main() {
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
 	let token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set");
+	Lazy::force(&NIX_USER);
+	Lazy::force(&SUDO_PASSWORD);
+	Lazy::force(&NIXPKGS_DIRECTORY);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
 
@@ -186,7 +201,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	let git_operations = GIT_OPERATIONS.lock().await;
 	let rev = String::from_utf8(
 		Command::new("jj")
-			.current_dir("/home/arne/nixpkgs-wt-2")
+			.current_dir(&*NIXPKGS_DIRECTORY)
 			.args("log --limit 1 --no-graph -T commit_id -r @".split_whitespace())
 			.stdout(Stdio::piped())
 			.spawn()?
@@ -198,7 +213,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 
 	let tmp = format!("/tmp/nixpkgs-{num}");
 	Command::new("git")
-		.current_dir("/home/arne/nixpkgs-wt-2")
+		.current_dir(&*NIXPKGS_DIRECTORY)
 		.args(["worktree", "add", &tmp, &format!("{rev}~")])
 		.spawn()?
 		.wait()
@@ -350,6 +365,10 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
 
 		let mut nix_args = vec![
+			"-u".to_owned(),
+			NIX_USER.clone(),
+			"--preserve-env=NIXPKGS_ALLOW_UNFREE,NIXPKGS_ALLOW_INSECURE".to_owned(),
+			"nix-shell".to_owned(),
 			"--run".to_owned(),
 			"exit".to_owned(),
 			"-k".to_owned(),
@@ -361,16 +380,22 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		for x in pkgs {
 			nix_args.push(x.to_owned());
 		}
-		let nix_output = Command::new("nix-shell")
+		let mut nix_output = Command::new("sudo")
 			.current_dir(&tmp)
 			.env("NIXPKGS_ALLOW_UNFREE", "1")
 			.env("NIXPKGS_ALLOW_INSECURE", "1")
 			.args(nix_args)
+			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
-			.spawn()?
-			.wait_with_output()
+			.spawn()?;
+		nix_output
+			.stdin
+			.as_mut()
+			.unwrap()
+			.write_all(format!("{}\n", &*SUDO_PASSWORD).as_bytes())
 			.await?;
+		let nix_output = nix_output.wait_with_output().await?;
 		if nix_output.status.success() {
 			if warn_merge {
 				reply!(
@@ -396,13 +421,13 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 
 	let git_operations = GIT_OPERATIONS.lock().await;
 	Command::new("git")
-		.current_dir("/home/arne/nixpkgs-wt-2")
+		.current_dir(&*NIXPKGS_DIRECTORY)
 		.args(["worktree", "remove", "--force", &tmp])
 		.spawn()?
 		.wait()
 		.await?;
 	//Command::new("git")
-	//	.current_dir("/home/arne/nixpkgs-wt-2")
+	//	.current_dir(&*NIXPKGS_DIRECTORY)
 	//	.args(["branch", "-D", &format!("nixpkgs-{num}")])
 	//	.spawn()?
 	//	.wait()
