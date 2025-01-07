@@ -9,7 +9,9 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use frankenstein::{AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent};
+use frankenstein::{
+	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent,
+};
 use once_cell::sync::Lazy;
 use tokio::{
 	fs,
@@ -46,7 +48,10 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	}
 
 	// Fetch new updates via long poll method
-	let mut update_params = GetUpdatesParams::builder().build();
+	let mut update_params = GetUpdatesParams::builder()
+		.allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction])
+		.build();
+	let mut messages = HashMap::new();
 	loop {
 		let stream = api.get_updates(&update_params).await;
 		if let Err(e) = stream {
@@ -58,73 +63,83 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 		for update in stream.result {
 			update_params.offset = Some(i64::from(update.update_id) + 1);
 			// If the received update contains a new message...
-			if let UpdateContent::Message(message) = update.content {
-				if let Some(data) = &message.text {
-					for data in data.split('\n') {
-						let (mut command, mut args) = data.split_once(' ').unwrap_or((data, ""));
-						// reply!(message, format!("error: message not conformant to command syntax"));
+			let mut message = if let UpdateContent::MessageReaction(reaction) = &update.content {
+				// TODO: use api.get_messages for older messages
+				messages.get(&reaction.message_id).cloned()
+			} else {
+				None
+			};
+			if let UpdateContent::Message(m) = update.content {
+				message = Some(m);
+			}
+			let Some(message) = message else { continue };
+			messages.insert(message.message_id, message.clone());
+			let Some(data) = &message.text else {
+				continue;
+			};
+			for data in data.split('\n') {
+				let (mut command, mut args) = data.split_once(' ').unwrap_or((data, ""));
+				// reply!(message, format!("error: message not conformant to command syntax"));
 
-						if let Some(pr_num) = command.strip_prefix("https://github.com/NixOS/nixpkgs/pull/") {
-							command = "/pr";
-							let pr_num = pr_num.split(|x: char| !x.is_digit(10)).next().unwrap();
-							args = pr_num;
+				if let Some(pr_num) = command.strip_prefix("https://github.com/NixOS/nixpkgs/pull/") {
+					command = "/pr";
+					let pr_num = pr_num.split(|x: char| !x.is_digit(10)).next().unwrap();
+					args = pr_num;
+				}
+
+				let args = args.to_owned();
+
+				// Print received text message to stdout.
+				// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
+
+				match command {
+					"/pr" => {
+						let api = Arc::clone(&api);
+						let message = message.clone();
+						task::spawn(async move {
+							let id = message.chat.id;
+							let (num, pkgs) = if args.contains(' ') {
+								let (num, pkgs) = args.split_once(' ').unwrap();
+								(
+									num.parse().unwrap_or(0),
+									pkgs.split_whitespace().map(|x| x.to_owned()).collect(),
+								)
+							} else {
+								(args.parse().unwrap_or(0), vec![])
+							};
+							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs).await {
+								println!("error: {:?}", e);
+								let _ = api
+									.send_message(
+										&SendMessageParams::builder()
+											.chat_id(id)
+											.text(format!("🤯 Internal error: {e:?}"))
+											.build(),
+									)
+									.await;
+							}
+							let mut prs = PRS_RUNNING.lock().await;
+							prs.remove(&num);
+							drop(prs);
+							let mut prs_building = PRS_BUILDING.lock().await;
+							prs_building.remove(&num);
+							drop(prs_building);
+						});
+					},
+					"/status" => {
+						let prs_building = PRS_BUILDING.lock().await;
+						let mut status = String::new();
+						for (num, pkgs) in prs_building.iter() {
+							status += &format!("PR {num}: {}", pkgs.join(" "));
 						}
-
-						let args = args.to_owned();
-
-						// Print received text message to stdout.
-						// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
-
-						match command {
-							"/pr" => {
-								let api = Arc::clone(&api);
-								let message = message.clone();
-								task::spawn(async move {
-									let id = message.chat.id;
-									let (num, pkgs) = if args.contains(' ') {
-										let (num, pkgs) = args.split_once(' ').unwrap();
-										(
-											num.parse().unwrap_or(0),
-											pkgs.split_whitespace().map(|x| x.to_owned()).collect(),
-										)
-									} else {
-										(args.parse().unwrap_or(0), vec![])
-									};
-									if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs).await {
-										println!("error: {:?}", e);
-										let _ = api
-											.send_message(
-												&SendMessageParams::builder()
-													.chat_id(id)
-													.text(format!("🤯 Internal error: {e:?}"))
-													.build(),
-											)
-											.await;
-									}
-									let mut prs = PRS_RUNNING.lock().await;
-									prs.remove(&num);
-									drop(prs);
-									let mut prs_building = PRS_BUILDING.lock().await;
-									prs_building.remove(&num);
-									drop(prs_building);
-								});
-							},
-							"/status" => {
-								let prs_building = PRS_BUILDING.lock().await;
-								let mut status = String::new();
-								for (num, pkgs) in prs_building.iter() {
-									status += &format!("PR {num}: {}", pkgs.join(" "));
-								}
-								if !status.is_empty() {
-									reply!(message, status);
-								}
-								drop(prs_building);
-							},
-							_ => {
-								reply!(message, format!("error: unknown command"));
-							},
+						if !status.is_empty() {
+							reply!(message, status);
 						}
-					}
+						drop(prs_building);
+					},
+					_ => {
+						reply!(message, format!("error: unknown command"));
+					},
 				}
 			}
 		}
@@ -238,6 +253,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	println!("PR {num}, changes:\n{}", lines.join("\n"));
 	reply!(msg, format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
 	let mut doit = true;
+	let mut warn_merge = false;
 	for line in &lines {
 		let id = line.split_once(' ').unwrap().0;
 		let cp = Command::new("git")
@@ -251,6 +267,10 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		let output = String::from_utf8_lossy(&cp.stdout);
 		let output_err = String::from_utf8_lossy(&cp.stderr);
 		if !cp.status.success() && !output_err.contains("--allow-empty") {
+			if output_err.contains("is a merge") {
+				warn_merge = true;
+				continue;
+			}
 			let diff = Command::new("git")
 				.current_dir(&tmp)
 				.args(&["diff"])
@@ -281,6 +301,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			continue;
 		};
 		if pkg.starts_with("Revert")
+			|| pkg.starts_with("Merge")
 			|| pkg.starts_with("treewide")
 			|| pkg.starts_with("nixos")
 			|| pkg.starts_with('-')
@@ -340,7 +361,14 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.wait_with_output()
 			.await?;
 		if nix_output.status.success() {
-			reply!(msg, format!("✅ PR {num}, built successfully"));
+			if warn_merge {
+				reply!(
+					msg,
+					format!("✅ PR {num}, built successfully\n⚠️ PR contains merge commits")
+				);
+			} else {
+				reply!(msg, format!("✅ PR {num}, built successfully"));
+			}
 		} else {
 			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);
 			let stdout = String::from_utf8_lossy(&stripped);
