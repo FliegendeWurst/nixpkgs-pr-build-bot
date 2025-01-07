@@ -10,7 +10,8 @@ use std::{
 };
 
 use frankenstein::{
-	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, LinkPreviewOptions, Message, SendMessageParams, UpdateContent
+	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, LinkPreviewOptions, Message, SendMessageParams,
+	UpdateContent,
 };
 use once_cell::sync::Lazy;
 use tokio::{
@@ -114,6 +115,9 @@ Ping t.me/FliegendeWurst if you have trouble.");
 							} else {
 								(args.parse().unwrap_or(0), vec![])
 							};
+							if num == 0 {
+								return;
+							}
 							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs).await {
 								println!("error: {:?}", e);
 								let _ = api
