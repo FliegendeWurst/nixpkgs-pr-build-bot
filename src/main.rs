@@ -10,7 +10,7 @@ use std::{
 };
 
 use frankenstein::{
-	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, Message, SendMessageParams, UpdateContent,
+	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, LinkPreviewOptions, Message, SendMessageParams, UpdateContent
 };
 use once_cell::sync::Lazy;
 use tokio::{
@@ -40,6 +40,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 			api.send_message(
 				&SendMessageParams::builder()
 					.chat_id($msg.chat.id)
+					.link_preview_options(LinkPreviewOptions::builder().is_disabled(true).build())
 					.text($txt)
 					.build(),
 			)
@@ -93,6 +94,12 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 				// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
 
 				match command {
+					"/start" => {
+						reply!(message, "This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
+You can also just send the PR as URL. Packages is a space seperated list of additional packages to build. You can exclude certain packages by prefixing them with -.
+PRs are tested by cherry-picking their commits on a somewhat recent master/staging merge, with strictDeps and PIE enabled by default, and all of my own PRs merged.
+Ping t.me/FliegendeWurst if you have trouble.");
+					},
 					"/pr" => {
 						let api = Arc::clone(&api);
 						let message = message.clone();
