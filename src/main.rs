@@ -371,6 +371,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
 
 		let mut nix_args = vec![
+			"-S".to_owned(),
 			"-u".to_owned(),
 			NIX_USER.clone(),
 			"--preserve-env=NIXPKGS_ALLOW_UNFREE,NIXPKGS_ALLOW_INSECURE".to_owned(),
