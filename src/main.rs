@@ -4,19 +4,19 @@ use std::{
 	collections::{HashMap, HashSet},
 	env,
 	error::Error,
+	num::{NonZero, NonZeroU64},
 	process::Stdio,
 	sync::Arc,
-	time::{Duration, SystemTime},
+	time::Duration,
 };
 
 use brace_expand::brace_expand;
 use frankenstein::{
-	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, LinkPreviewOptions, Message, SendMessageParams,
-	UpdateContent,
+	AllowedUpdate, AsyncApi, AsyncTelegramApi, EditMessageTextParams, GetUpdatesParams, LinkPreviewOptions, Message,
+	SendMessageParams, UpdateContent,
 };
 use once_cell::sync::Lazy;
 use tokio::{
-	fs,
 	io::AsyncWriteExt,
 	process::Command,
 	sync::{Mutex, Semaphore},
@@ -38,6 +38,24 @@ static NIXPKGS_DIRECTORY: Lazy<String> = Lazy::new(|| {
 	env::var("NIXPKGS_PR_BUILD_BOT_NIXPKGS_DIRECTORY")
 		.expect("NIXPKGS_PR_BUILD_BOT_NIXPKGS_DIRECTORY not set to jj-colocated checkout of nixpkgs")
 });
+static CORES: Lazy<Option<u64>> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_CORES")
+		.ok()
+		.map(|x| x.parse::<u64>().ok())
+		.flatten()
+		.map(|x| NonZeroU64::new(x))
+		.flatten()
+		.map(|x| x.get())
+});
+static JOBS: Lazy<NonZero<u64>> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_JOBS")
+		.ok()
+		.map(|x| x.parse::<u64>().ok())
+		.flatten()
+		.map(|x| NonZeroU64::new(x))
+		.flatten()
+		.unwrap_or(NonZero::new(6).unwrap())
+});
 
 #[tokio::main]
 async fn main() {
@@ -49,6 +67,8 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&NIX_USER);
 	Lazy::force(&SUDO_PASSWORD);
 	Lazy::force(&NIXPKGS_DIRECTORY);
+	Lazy::force(&CORES);
+	Lazy::force(&JOBS);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
 
@@ -110,7 +130,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 				// Print received text message to stdout.
 				// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
 
-				match command {
+				match &*command.to_ascii_lowercase() {
 					"/start" => {
 						reply!(message, "This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
 You can also just send the PR as URL. Packages is a space seperated list of additional packages to build. You can exclude certain packages by prefixing them with -.
@@ -157,6 +177,9 @@ Ping t.me/FliegendeWurst if you have trouble.");
 						let prs_building = PRS_BUILDING.lock().await;
 						let mut status = String::new();
 						for (num, pkgs) in prs_building.iter() {
+							if !status.is_empty() {
+								status.push('\n');
+							}
 							status += &format!("PR {num}: {}", pkgs.join(" "));
 						}
 						if !status.is_empty() {
@@ -174,11 +197,6 @@ Ping t.me/FliegendeWurst if you have trouble.");
 }
 
 async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<String>) -> Result<(), anyhow::Error> {
-	pkgs = pkgs
-		.into_iter()
-		.map(|x| brace_expand(&x).into_iter())
-		.flatten()
-		.collect();
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
 			api.send_message(
@@ -187,9 +205,46 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 					.text($txt)
 					.build(),
 			)
-			.await?;
+			.await?
+			.result
 		};
 	}
+	// first verify the PR is not against a stable branch
+	let json = api
+		.client
+		.execute(
+			api.client
+				.get(format!("https://api.github.com/repos/NixOS/nixpkgs/pulls/{num}"))
+				.header(
+					"User-Agent",
+					concat!("nixpkgs-pr-build-bot/", env!("CARGO_PKG_VERSION")),
+				)
+				.build()?,
+		)
+		.await?;
+	let json: serde_json::Value = json.json().await?;
+	let base = json
+		.pointer("/base/ref")
+		.map(|x| x.as_str())
+		.flatten()
+		.unwrap_or("release-");
+
+	if base != "master" && base != "staging" && base != "staging-next" {
+		reply!(msg, "🛑 PR does not target master/staging/staging-next");
+		return Ok(());
+	}
+
+	pkgs = pkgs
+		.into_iter()
+		.map::<Box<dyn Iterator<Item = _>>, _>(|x| {
+			if x.contains("override") {
+				Box::new(Some(x).into_iter())
+			} else {
+				Box::new(brace_expand(&x).into_iter())
+			}
+		})
+		.flatten()
+		.collect();
 
 	let Ok(ticket) = TASKS_RUNNING.try_acquire() else {
 		reply!(msg, "🤖 too many PRs already running");
@@ -202,7 +257,22 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	}
 	prs.insert(num);
 	drop(prs);
-	reply!(msg, format!("⏳ PR {num}, fetching ..."));
+	let mut msg_text = format!("⏳ PR {num}, fetching ...");
+	let my_msg = reply!(msg, &msg_text);
+	macro_rules! extend_message {
+		($new_text:expr) => {
+			msg_text.push('\n');
+			msg_text += &($new_text);
+			api.edit_message_text(
+				&EditMessageTextParams::builder()
+					.chat_id(msg.chat.id)
+					.message_id(my_msg.message_id)
+					.text(&msg_text)
+					.build(),
+			)
+			.await?;
+		};
+	}
 
 	let git_operations = GIT_OPERATIONS.lock().await;
 	let rev = String::from_utf8(
@@ -249,17 +319,6 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		.spawn()?
 		.wait()
 		.await?;
-	fs::write(
-		format!("{tmp}/jujutsu_hack.txt"),
-		format!(
-			"dummy {num} {}",
-			SystemTime::now()
-				.duration_since(SystemTime::UNIX_EPOCH)
-				.unwrap()
-				.as_secs()
-		),
-	)
-	.await?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("add .".split(' '))
@@ -283,7 +342,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	let mut lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
 	lines.reverse();
 	println!("PR {num}, changes:\n{}", lines.join("\n"));
-	reply!(msg, format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
+	extend_message!(format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
 	let mut doit = true;
 	let mut warn_merge = false;
 	for line in &lines {
@@ -311,7 +370,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 				.wait_with_output()
 				.await?;
 			let output_diff = String::from_utf8_lossy(&diff.stdout);
-			let url = paste(&format!(
+			let url = paste(&format!("PR {num} - cherry-pick conflict"), "", &format!(
 				"git cherry-pick standard output:\n{output}\ngit cherry-pick standard error:\n{output_err}\ngit diff output:\n{output_diff}"
 			))
 			.await?;
@@ -336,6 +395,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			|| pkg.starts_with("Merge")
 			|| pkg.starts_with("treewide")
 			|| pkg.starts_with("nixos")
+			|| pkg.starts_with("lib.")
 			|| pkg.starts_with('-')
 			|| pkg.contains(' ')
 			|| pkg.starts_with("maintainers")
@@ -368,7 +428,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	drop(prs_building);
 	println!("PR {num}, building: {pkgs_to_build}");
 	if doit {
-		reply!(msg, format!("⏳ PR {num}, building: {pkgs_to_build}"));
+		extend_message!(format!("⏳ PR {num}, building: {pkgs_to_build}"));
 
 		let mut nix_args = vec![
 			"-S".to_owned(),
@@ -379,17 +439,21 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			"--run".to_owned(),
 			"sh -c 'echo $buildInputs'".to_owned(),
 			"-k".to_owned(),
-			"-j6".to_owned(),
+			"-j".to_owned(),
+			format!("{}", *JOBS),
 			"-I".to_owned(),
 			format!("nixpkgs={tmp}"),
-			"-p".to_owned(),
 		];
+		if let Some(cores) = *CORES {
+			nix_args.extend(format!("--cores {cores}").split(' ').map(|x| x.to_owned()));
+		}
+		nix_args.push("-p".to_owned());
 		for x in pkgs {
 			if x.starts_with("pkgs") {
 				nix_args.push(x);
 			} else {
 				nix_args.push(format!(
-					r#"pkgs.{x} or undefined-variable.override {{ pname = "{x}"; }}"#
+					r#"pkgs.{x} or (undefined-variable.override {{ pname = "{x}"; }})"#
 				));
 			}
 		}
@@ -411,31 +475,44 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		let nix_output = nix_output.wait_with_output().await?;
 		if nix_output.status.success() {
 			let stdout = String::from_utf8_lossy(&nix_output.stdout);
-			let built: Vec<_> = stdout
+			let built: Vec<&str> = stdout
 				.split(' ')
 				// strip nix-store prefix
 				.map(|x| if x.len() > 44 { &x[44..] } else { x })
 				.map(|x| x.trim_ascii_end())
 				.collect();
-			let built = built.join(" ");
-			let warn_undefined = built.contains("undefined-variable");
+			let built_for_real = built
+				.iter()
+				.filter(|x| !x.starts_with("undefined-variable"))
+				.copied()
+				.collect::<Vec<_>>()
+				.join(" ");
+			let warn_undefined = built
+				.iter()
+				.flat_map(|x| x.strip_prefix("undefined-variable-"))
+				.collect::<Vec<_>>()
+				.join(" ");
 			let mut extra = String::new();
 			if warn_merge {
 				extra += "\n⚠️ PR contains merge commits";
 			}
-			if warn_undefined {
-				extra += "\n⚠️ PR names undefined variables in commits";
+			if !warn_undefined.is_empty() {
+				extra += "\n⚠️ Undefined variables: {warn_undefined}";
 			}
-			reply!(msg, format!("✅ PR {num}, built {built}{extra}"));
+			if built_for_real.is_empty() {
+				reply!(msg, format!("❓ PR {num}, nothing built{extra}"));
+			} else {
+				reply!(msg, format!("✅ PR {num}, built {built_for_real}{extra}"));
+			}
 		} else {
 			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);
 			let stdout = String::from_utf8_lossy(&stripped);
-			if stdout.len() < 1000 {
+			if stdout.split('\n').skip(10).next().is_none() {
 				reply!(msg, format!("💥 PR {num}, build failed"));
 				reply!(msg, stdout);
 			} else {
 				let text = stdout.as_ref();
-				let url = paste(text).await?;
+				let url = paste(&format!("PR #{num} - summary"), &format!("PR #{num}"), text).await?;
 				reply!(msg, format!("💥 PR {num}, build failed\n👉 Full log: {url}",));
 			}
 		}
@@ -473,26 +550,39 @@ impl<T: PartialEq<U>, U> VecRemoveItem<T, U> for Vec<T> {
 	}
 }
 
-async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
+async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<String, anyhow::Error> {
 	let mut map = serde_json::json!({
+		"title": title,
 		"extension": "log",
 		"expires": 7 * 24 * 60 * 60
 	});
-	let mut failures = text
-		.split('\n')
+	let lines = text.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
+	let mut failures = lines
+		.iter()
+		.copied()
 		.map_windows(|x: &[&str; 26]| {
 			if x[25].contains("For full logs, run") {
-				Some(*x)
+				Some(x.to_vec())
 			} else {
 				None
 			}
 		})
 		.flatten()
+		.chain(
+			if lines.len() < 26 && lines.last().unwrap().contains("For full logs, run") {
+				Some(lines.clone())
+			} else {
+				None
+			},
+		)
 		.map(|x| {
 			x.into_iter()
 				.flat_map(|x| {
+					// indent is different depending on top-level vs. dependency fail
 					x.strip_prefix("       > ")
+						.or(x.strip_prefix("      > "))
 						.or(x.strip_prefix("       For full logs, run "))
+						.or(x.strip_prefix("      For full logs, run "))
 				})
 				.chain(Some("\n"))
 		})
@@ -515,7 +605,12 @@ async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
 			.await?;
 		let stripped = strip_ansi_escapes::strip(&nix_output.stdout);
 		let s = String::from_utf8_lossy(&stripped);
-		let url = Box::pin(paste(&s)).await?;
+		let url = Box::pin(paste(
+			&format!("{title_prefix} - {}", &line[44..line.len() - 4]),
+			title_prefix,
+			&s,
+		))
+		.await?;
 		line_orig.pop();
 		*line_orig += ": ";
 		*line_orig += &url;
@@ -527,7 +622,7 @@ async fn paste(mut text: &str) -> Result<String, anyhow::Error> {
 	if !failures.is_empty() {
 		map.as_object_mut()
 			.unwrap()
-			.insert("text".to_owned(), format!("{}\n\n{}", failures.join("\n"), text).into());
+			.insert("text".to_owned(), format!("{}", failures.join("\n")).into());
 	} else {
 		map.as_object_mut().unwrap().insert("text".to_owned(), text.into());
 	}
