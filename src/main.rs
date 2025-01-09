@@ -9,6 +9,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
+use brace_expand::brace_expand;
 use frankenstein::{
 	AllowedUpdate, AsyncApi, AsyncTelegramApi, GetUpdatesParams, LinkPreviewOptions, Message, SendMessageParams,
 	UpdateContent,
@@ -173,6 +174,11 @@ Ping t.me/FliegendeWurst if you have trouble.");
 }
 
 async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<String>) -> Result<(), anyhow::Error> {
+	pkgs = pkgs
+		.into_iter()
+		.map(|x| brace_expand(&x).into_iter())
+		.flatten()
+		.collect();
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
 			api.send_message(
@@ -344,6 +350,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			pkgs.push(pkg.to_owned());
 		}
 	}
+	pkgs.sort();
+	pkgs.dedup();
 	let to_remove = pkgs
 		.iter()
 		.flat_map(|x| x.strip_prefix('-'))
@@ -354,8 +362,6 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	}
 	pkgs.retain(|x| !x.starts_with('-'));
 
-	pkgs.sort();
-	pkgs.dedup();
 	let pkgs_to_build = pkgs.join(" ");
 	let mut prs_building = PRS_BUILDING.lock().await;
 	prs_building.insert(num, pkgs.clone());
