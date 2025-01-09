@@ -377,7 +377,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			"--preserve-env=NIXPKGS_ALLOW_UNFREE,NIXPKGS_ALLOW_INSECURE".to_owned(),
 			"nix-shell".to_owned(),
 			"--run".to_owned(),
-			"exit".to_owned(),
+			"sh -c 'echo $buildInputs'".to_owned(),
 			"-k".to_owned(),
 			"-j6".to_owned(),
 			"-I".to_owned(),
@@ -385,7 +385,13 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			"-p".to_owned(),
 		];
 		for x in pkgs {
-			nix_args.push(x.to_owned());
+			if x.starts_with("pkgs") {
+				nix_args.push(x);
+			} else {
+				nix_args.push(format!(
+					r#"pkgs.{x} or undefined-variable.override {{ pname = "{x}"; }}"#
+				));
+			}
 		}
 		let mut nix_output = Command::new("sudo")
 			.current_dir(&tmp)
@@ -404,14 +410,23 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.await?;
 		let nix_output = nix_output.wait_with_output().await?;
 		if nix_output.status.success() {
+			let stdout = String::from_utf8_lossy(&nix_output.stdout);
+			let built: Vec<_> = stdout
+				.split(' ')
+				// strip nix-store prefix
+				.map(|x| if x.len() > 44 { &x[44..] } else { x })
+				.map(|x| x.trim_ascii_end())
+				.collect();
+			let built = built.join(" ");
+			let warn_undefined = built.contains("undefined-variable");
+			let mut extra = String::new();
 			if warn_merge {
-				reply!(
-					msg,
-					format!("✅ PR {num}, built successfully\n⚠️ PR contains merge commits")
-				);
-			} else {
-				reply!(msg, format!("✅ PR {num}, built successfully"));
+				extra += "\n⚠️ PR contains merge commits";
 			}
+			if warn_undefined {
+				extra += "\n⚠️ PR names undefined variables in commits";
+			}
+			reply!(msg, format!("✅ PR {num}, built {built}{extra}"));
 		} else {
 			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);
 			let stdout = String::from_utf8_lossy(&stripped);
