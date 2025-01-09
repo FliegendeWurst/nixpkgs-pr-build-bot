@@ -4,7 +4,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	env,
 	error::Error,
-	num::{NonZero, NonZeroU64},
+	num::NonZero,
 	process::Stdio,
 	sync::Arc,
 	time::Duration,
@@ -23,7 +23,7 @@ use tokio::{
 	task,
 };
 
-static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(10));
+static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TASKS.get()));
 static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static PRS_BUILDING: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -43,7 +43,7 @@ static CORES: Lazy<Option<u64>> = Lazy::new(|| {
 		.ok()
 		.map(|x| x.parse::<u64>().ok())
 		.flatten()
-		.map(|x| NonZeroU64::new(x))
+		.map(|x| NonZero::new(x))
 		.flatten()
 		.map(|x| x.get())
 });
@@ -52,10 +52,21 @@ static JOBS: Lazy<NonZero<u64>> = Lazy::new(|| {
 		.ok()
 		.map(|x| x.parse::<u64>().ok())
 		.flatten()
-		.map(|x| NonZeroU64::new(x))
+		.map(|x| NonZero::new(x))
 		.flatten()
 		.unwrap_or(NonZero::new(6).unwrap())
 });
+static TASKS: Lazy<NonZero<usize>> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_TASKS")
+		.ok()
+		.map(|x| x.parse::<usize>().ok())
+		.flatten()
+		.map(|x| NonZero::new(x))
+		.flatten()
+		.unwrap_or(NonZero::new(10).unwrap())
+});
+static WASTEBIN_URL: Lazy<String> =
+	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_WASTEBIN").unwrap_or("https://paste.fliegendewurst.eu".to_owned()));
 
 #[tokio::main]
 async fn main() {
@@ -69,6 +80,8 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&NIXPKGS_DIRECTORY);
 	Lazy::force(&CORES);
 	Lazy::force(&JOBS);
+	Lazy::force(&TASKS);
+	Lazy::force(&WASTEBIN_URL);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
 
@@ -628,14 +641,11 @@ async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<String
 	}
 
 	let client = reqwest::Client::new();
-	let res = client
-		.post("https://paste.fliegendewurst.eu/")
-		.json(&map)
-		.send()
-		.await?;
+	let res = client.post(&*WASTEBIN_URL).json(&map).send().await?;
 	let res: serde_json::Value = res.json().await?;
 	Ok(format!(
-		"https://paste.fliegendewurst.eu{}",
+		"{}{}",
+		*WASTEBIN_URL,
 		res.get("path").unwrap().as_str().unwrap()
 	))
 }
