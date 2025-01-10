@@ -558,7 +558,7 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 				extra += "\n⚠️ PR contains merge commits";
 			}
 			if !warn_undefined.is_empty() {
-				extra += "\n⚠️ Undefined variables: {warn_undefined}";
+				extra += &format!("\n⚠️ Undefined variables: {warn_undefined}");
 			}
 			if built_for_real.is_empty() {
 				reply!(msg, format!("❓ PR {num}, nothing built{extra}"));
