@@ -10,6 +10,7 @@ use std::{
 	time::Duration,
 };
 
+use anyhow::Context;
 use brace_expand::brace_expand;
 use frankenstein::{
 	AllowedUpdate, AsyncApi, AsyncTelegramApi, EditMessageTextParams, GetUpdatesParams, LinkPreviewOptions, Message,
@@ -72,7 +73,12 @@ static CONTACT: Lazy<String> =
 
 #[tokio::main]
 async fn main() {
-	real_main().await.unwrap();
+	loop {
+		if let Err(e) = real_main().await {
+			eprintln!("general error: {e:?}");
+		}
+		tokio::time::sleep(Duration::from_secs(10)).await;
+	}
 }
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
@@ -234,7 +240,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 					.text($txt)
 					.build(),
 			)
-			.await?
+			.await
+			.context("sending reply")?
 			.result
 		};
 	}
@@ -250,8 +257,9 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 				)
 				.build()?,
 		)
-		.await?;
-	let json: serde_json::Value = json.json().await?;
+		.await
+		.context("getting PR base ref")?;
+	let json: serde_json::Value = json.json().await.context("decoding GH API response")?;
 	let base = json
 		.pointer("/base/ref")
 		.map(|x| x.as_str())
@@ -299,7 +307,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 					.text(&msg_text)
 					.build(),
 			)
-			.await?;
+			.await
+			.context("editing response")?;
 		};
 	}
 
@@ -311,7 +320,8 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.stdout(Stdio::piped())
 			.spawn()?
 			.wait_with_output()
-			.await?
+			.await
+			.context("running jj to get current working copy")?
 			.stdout,
 	)
 	.unwrap();
@@ -320,53 +330,69 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	Command::new("git")
 		.current_dir(&*NIXPKGS_DIRECTORY)
 		.args(["worktree", "add", &tmp, &format!("{rev}~")])
-		.spawn()?
+		.spawn()
+		.context("creating worktree with git")?
 		.wait()
-		.await?;
+		.await
+		.context("creating worktree with git")?;
 
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["fetch", "origin", "master", "staging", "staging-next"])
-		.spawn()?
+		.spawn()
+		.context("fetching upstream with git")?
 		.wait()
-		.await?;
+		.await
+		.context("fetching upstream with git")?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["fetch", "origin", &format!("pull/{num}/head")])
-		.spawn()?
+		.spawn()
+		.context("fetching PR HEAD with git")?
 		.wait()
-		.await?;
+		.await
+		.context("fetching PR HEAD with git")?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["switch", "-C", &format!("nixpkgs-{num}")])
-		.spawn()?
+		.spawn()
+		.context("switching to new branch with git")?
 		.wait()
-		.await?;
+		.await
+		.context("switching to new branch with git")?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["restore", "-s", &rev, "--", "."])
-		.spawn()?
+		.spawn()
+		.context("restoring working copy with git")?
 		.wait()
-		.await?;
+		.await
+		.context("restoring working copy with git")?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("add .".split(' '))
-		.spawn()?
+		.spawn()
+		.context("adding working copy with git")?
 		.wait()
-		.await?;
+		.await
+		.context("restoring working copy with git")?;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("commit -a --message wip".split(' '))
-		.spawn()?
+		.spawn()
+		.context("committing working copy with git")?
 		.wait()
-		.await?;
+		.await
+		.context("committing working copy with git")?;
 	let output = Command::new("git")
 		.current_dir(&tmp)
 		.args("log --oneline FETCH_HEAD --not origin/master origin/staging origin/staging-next".split(' '))
 		.stdout(Stdio::piped())
-		.spawn()?
+		.spawn()
+		.context("getting new commits in PR with git")?
 		.wait_with_output()
-		.await?;
+		.await
+		.context("getting new commits in PR with git")?;
 	let out = String::from_utf8(output.stdout)?;
 	let mut lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
 	lines.reverse();
@@ -381,9 +407,11 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.args(format!("cherry-pick --allow-empty -x {id}").split(' '))
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
-			.spawn()?
+			.spawn()
+			.context("cherry-picking PR commit with git")?
 			.wait_with_output()
-			.await?;
+			.await
+			.context("cherry-picking PR commit with git")?;
 		let output = String::from_utf8_lossy(&cp.stdout);
 		let output_err = String::from_utf8_lossy(&cp.stderr);
 		if !cp.status.success() && !output_err.contains("--allow-empty") {
@@ -395,14 +423,16 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 				.current_dir(&tmp)
 				.args(&["diff"])
 				.stdout(Stdio::piped())
-				.spawn()?
+				.spawn()
+				.context("getting conflict diff with git")?
 				.wait_with_output()
-				.await?;
+				.await
+				.context("getting conflict diff with git")?;
 			let output_diff = String::from_utf8_lossy(&diff.stdout);
 			let url = paste(&format!("PR {num} - cherry-pick conflict"), "", &format!(
 				"git cherry-pick standard output:\n{output}\ngit cherry-pick standard error:\n{output_err}\ngit diff output:\n{output_diff}"
 			))
-			.await?;
+			.await.context("uploading diff output as paste")?;
 			reply!(
 				msg,
 				format!("😢 PR {num}, cherry-pick of {id} failed\n👉 Conflict: {url}")
@@ -494,13 +524,15 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
-			.spawn()?;
+			.spawn()
+			.context("running nix")?;
 		nix_output
 			.stdin
 			.as_mut()
 			.unwrap()
 			.write_all(format!("{}\n", &*SUDO_PASSWORD).as_bytes())
-			.await?;
+			.await
+			.context("running nix")?;
 		let nix_output = nix_output.wait_with_output().await?;
 		if nix_output.status.success() {
 			let stdout = String::from_utf8_lossy(&nix_output.stdout);
@@ -541,7 +573,9 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 				reply!(msg, stdout);
 			} else {
 				let text = stdout.as_ref();
-				let url = paste(&format!("PR #{num} - summary"), &format!("PR #{num}"), text).await?;
+				let url = paste(&format!("PR #{num} - summary"), &format!("PR #{num}"), text)
+					.await
+					.context("uploading logs as paste")?;
 				reply!(msg, format!("💥 PR {num}, build failed\n👉 Full log: {url}",));
 			}
 		}
@@ -551,9 +585,11 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	Command::new("git")
 		.current_dir(&*NIXPKGS_DIRECTORY)
 		.args(["worktree", "remove", "--force", &tmp])
-		.spawn()?
+		.spawn()
+		.context("removing worktree with git")?
 		.wait()
-		.await?;
+		.await
+		.context("removing worktree with git")?;
 	//Command::new("git")
 	//	.current_dir(&*NIXPKGS_DIRECTORY)
 	//	.args(["branch", "-D", &format!("nixpkgs-{num}")])
