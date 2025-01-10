@@ -67,6 +67,8 @@ static TASKS: Lazy<NonZero<usize>> = Lazy::new(|| {
 });
 static WASTEBIN_URL: Lazy<String> =
 	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_WASTEBIN").unwrap_or("https://paste.fliegendewurst.eu".to_owned()));
+static CONTACT: Lazy<String> =
+	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_CONTACT").unwrap_or("this bot's owner".to_owned()));
 
 #[tokio::main]
 async fn main() {
@@ -82,6 +84,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&JOBS);
 	Lazy::force(&TASKS);
 	Lazy::force(&WASTEBIN_URL);
+	Lazy::force(&CONTACT);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
 
@@ -129,26 +132,33 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 				continue;
 			};
 			for data in data.split('\n') {
-				let (mut command, mut args) = data.split_once(' ').unwrap_or((data, ""));
-				// reply!(message, format!("error: message not conformant to command syntax"));
+				let (mut command, mut args) = data
+					.split_once(' ')
+					.map(|x| (x.0.to_owned(), x.1.to_owned()))
+					.unwrap_or((data.to_owned(), "".to_owned()));
 
 				if let Some(pr_num) = command.strip_prefix("https://github.com/NixOS/nixpkgs/pull/") {
-					command = "/pr";
 					let pr_num = pr_num.split(|x: char| !x.is_digit(10)).next().unwrap();
-					args = pr_num;
+					args = format!("{pr_num} {args}");
+					command = "/pr".to_owned();
 				}
 
 				let args = args.to_owned();
 
 				// Print received text message to stdout.
-				// println!("<{}>: {}", &message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(), data);
+				println!(
+					"<{} {:?}>: {}",
+					message.from.as_ref().map(|x| x.id).unwrap_or(0),
+					&message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(),
+					data
+				);
 
 				match &*command.to_ascii_lowercase() {
 					"/start" => {
-						reply!(message, "This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
+						reply!(message, format!("This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
 You can also just send the PR as URL. Packages is a space seperated list of additional packages to build. You can exclude certain packages by prefixing them with -.
 PRs are tested by cherry-picking their commits on a somewhat recent master/staging merge, with strictDeps and PIE enabled by default, and all of my own PRs merged.
-Ping t.me/FliegendeWurst if you have trouble.");
+Ping {} if you have trouble.", *CONTACT));
 					},
 					"/pr" => {
 						let api = Arc::clone(&api);
