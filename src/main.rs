@@ -13,7 +13,7 @@ use std::{
 use brace_expand::brace_expand;
 use frankenstein::{
 	AllowedUpdate, AsyncApi, AsyncTelegramApi, EditMessageTextParams, GetUpdatesParams, LinkPreviewOptions, Message,
-	SendMessageParams, UpdateContent,
+	ReplyParameters, SendMessageParams, UpdateContent,
 };
 use once_cell::sync::Lazy;
 use tokio::{
@@ -215,6 +215,12 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			api.send_message(
 				&SendMessageParams::builder()
 					.chat_id($msg.chat.id)
+					.reply_parameters(
+						ReplyParameters::builder()
+							.message_id($msg.message_id)
+							.chat_id($msg.chat.id)
+							.build(),
+					)
 					.text($txt)
 					.build(),
 			)
