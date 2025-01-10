@@ -4,6 +4,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	env,
 	error::Error,
+	io::Cursor,
 	num::NonZero,
 	process::Stdio,
 	sync::Arc,
@@ -12,6 +13,7 @@ use std::{
 
 use anyhow::Context;
 use brace_expand::brace_expand;
+use bytes::Bytes;
 use frankenstein::{
 	AllowedUpdate, AsyncApi, AsyncTelegramApi, EditMessageTextParams, GetUpdatesParams, LinkPreviewOptions, Message,
 	ReplyParameters, SendMessageParams, UpdateContent,
@@ -23,6 +25,7 @@ use tokio::{
 	sync::{Mutex, Semaphore},
 	task,
 };
+use zip::ZipArchive;
 
 static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TASKS.get()));
 static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
@@ -70,6 +73,7 @@ static WASTEBIN_URL: Lazy<String> =
 	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_WASTEBIN").unwrap_or("https://paste.fliegendewurst.eu".to_owned()));
 static CONTACT: Lazy<String> =
 	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_CONTACT").unwrap_or("this bot's owner".to_owned()));
+static GH_TOKEN: Lazy<Option<String>> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_GH_TOKEN").ok());
 
 #[tokio::main]
 async fn main() {
@@ -91,6 +95,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&TASKS);
 	Lazy::force(&WASTEBIN_URL);
 	Lazy::force(&CONTACT);
+	Lazy::force(&GH_TOKEN);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
 
@@ -159,6 +164,11 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 					data
 				);
 
+				let full = command.to_ascii_lowercase() == "/full";
+				if full {
+					command = "/pr".to_owned();
+				}
+
 				match &*command.to_ascii_lowercase() {
 					"/start" => {
 						reply!(message, format!("This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
@@ -183,7 +193,7 @@ Ping {} if you have trouble.", *CONTACT));
 							if num == 0 {
 								return;
 							}
-							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs).await {
+							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs, full).await {
 								println!("error: {:?}", e);
 								let _ = api
 									.send_message(
@@ -225,7 +235,13 @@ Ping {} if you have trouble.", *CONTACT));
 	}
 }
 
-async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<String>) -> Result<(), anyhow::Error> {
+async fn process_pr(
+	api: Arc<AsyncApi>,
+	msg: Message,
+	num: u32,
+	mut pkgs: Vec<String>,
+	full: bool,
+) -> Result<(), anyhow::Error> {
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
 			api.send_message(
@@ -271,18 +287,6 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 		return Ok(());
 	}
 
-	pkgs = pkgs
-		.into_iter()
-		.map::<Box<dyn Iterator<Item = _>>, _>(|x| {
-			if x.contains("override") {
-				Box::new(Some(x).into_iter())
-			} else {
-				Box::new(brace_expand(&x).into_iter())
-			}
-		})
-		.flatten()
-		.collect();
-
 	let Ok(ticket) = TASKS_RUNNING.try_acquire() else {
 		reply!(msg, "🤖 too many PRs already running");
 		return Ok(());
@@ -311,6 +315,160 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			.context("editing response")?;
 		};
 	}
+
+	'eval: {
+		// for reference: https://github.com/Mic92/nixpkgs-review/pull/435
+		if !full {
+			break 'eval;
+		}
+		let Some(token) = GH_TOKEN.as_ref() else {
+			extend_message!("⚠️ no GH token configured");
+			break 'eval;
+		};
+		let Some(commit_sha) = json.pointer("/head/sha").map(|x| x.as_str()).flatten() else {
+			extend_message!("⚠️ could not fetch PR HEAD");
+			break 'eval;
+		};
+		let workflow_runs_resp: serde_json::Value = api
+			.client
+			.execute(
+				api.client
+					.get(format!(
+						"https://api.github.com/repos/NixOS/nixpkgs/actions/runs?head_sha={commit_sha}"
+					))
+					.header(
+						"User-Agent",
+						concat!("nixpkgs-pr-build-bot/", env!("CARGO_PKG_VERSION")),
+					)
+					.build()?,
+			)
+			.await
+			.context("getting GHA runs for PR")?
+			.json()
+			.await
+			.context("decoding GH api response for runs")?;
+
+		let Some(runs) = workflow_runs_resp
+			.pointer("/workflow_runs")
+			.map(|x| x.as_array())
+			.flatten()
+		else {
+			extend_message!("⚠️ no workflow runs found");
+			break 'eval;
+		};
+
+		let Some(run) = runs
+			.into_iter()
+			.filter(|x| x.pointer("/name").map(|x| x.as_str()).flatten() == Some("Eval"))
+			.next()
+		else {
+			extend_message!("⚠️ no eval run found");
+			break 'eval;
+		};
+
+		let Some(artifacts_url) = run.pointer("/artifacts_url").map(|x| x.as_str()).flatten() else {
+			extend_message!("⚠️ no eval artifact found (wait for eval to complete)");
+			break 'eval;
+		};
+
+		let artifact: serde_json::Value = api
+			.client
+			.execute(
+				api.client
+					.get(artifacts_url)
+					.header(
+						"User-Agent",
+						concat!("nixpkgs-pr-build-bot/", env!("CARGO_PKG_VERSION")),
+					)
+					.build()?,
+			)
+			.await
+			.context("getting GHA Eval artifact for PR")?
+			.json()
+			.await
+			.context("decoding GH api response for Eval artifact")?;
+		let Some(artifacts) = artifact
+			.pointer("/artifacts")
+			.map(|x| {
+				x.as_array()
+					.map(|x| x.into_iter().flat_map(|x| x.as_object()).collect::<Vec<_>>())
+			})
+			.flatten()
+		else {
+			extend_message!("⚠️ eval artifact not found");
+			break 'eval;
+		};
+		let Some(artifact_id) = artifacts
+			.iter()
+			.filter(|x| x.get("name").map(|x| x.as_str()).flatten() == Some("comparison"))
+			.map(|x| x.get("id").map(|x| x.as_u64()).flatten())
+			.next()
+			.flatten()
+		else {
+			extend_message!("⚠️ artifact ID not found");
+			break 'eval;
+		};
+		let zip_url = format!("https://api.github.com/repos/NixOS/nixpkgs/actions/artifacts/{artifact_id}/zip");
+		let artifact: Bytes = api
+			.client
+			.execute(
+				api.client
+					.get(zip_url)
+					.bearer_auth(token)
+					.header(
+						"User-Agent",
+						concat!("nixpkgs-pr-build-bot/", env!("CARGO_PKG_VERSION")),
+					)
+					.build()?,
+			)
+			.await
+			.context("downloading GHA Eval artifact for PR")?
+			.bytes()
+			.await
+			.context("getting bytes of GHA Eval artifact")?;
+
+		let mut zip = ZipArchive::new(Cursor::new(&artifact)).context("reading GHA Eval zip")?;
+
+		let changed_paths = zip
+			.by_name("changed-paths.json")
+			.context("finding changed-paths json")?;
+
+		let changed_paths: serde_json::Value =
+			serde_json::from_reader(changed_paths).context("unzipping changed-paths json")?;
+
+		println!("{changed_paths:?}");
+
+		let Some(added) = changed_paths.pointer("/attrdiff/added").map(|x| x.as_array()).flatten() else {
+			extend_message!("⚠️ added packages not found");
+			break 'eval;
+		};
+		let Some(changed) = changed_paths
+			.pointer("/attrdiff/changed")
+			.map(|x| x.as_array())
+			.flatten()
+		else {
+			extend_message!("⚠️ changed packages not found");
+			break 'eval;
+		};
+		for x in added.into_iter().chain(changed.into_iter()).flat_map(|x| x.as_str()) {
+			if x == "nixos-install-tools" || x == "tests.nixos-functions.nixos-test" {
+				continue; // stupidly always get rebuilt
+			}
+			pkgs.push(x.to_owned());
+		}
+	}
+
+	pkgs = pkgs
+		.into_iter()
+		.map::<Box<dyn Iterator<Item = _>>, _>(|x| {
+			if x.contains("override") {
+				Box::new(Some(x).into_iter())
+			} else {
+				Box::new(brace_expand(&x).into_iter())
+			}
+		})
+		.flatten()
+		.collect();
 
 	let git_operations = GIT_OPERATIONS.lock().await;
 	let rev = String::from_utf8(
@@ -486,6 +644,11 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 	prs_building.insert(num, pkgs.clone());
 	drop(prs_building);
 	println!("PR {num}, building: {pkgs_to_build}");
+	let pkgs_to_build = if pkgs_to_build.len() > 1000 {
+		format!("{} packages", pkgs.len())
+	} else {
+		pkgs_to_build
+	};
 	if doit {
 		extend_message!(format!("⏳ PR {num}, building: {pkgs_to_build}"));
 
@@ -511,9 +674,21 @@ async fn process_pr(api: Arc<AsyncApi>, msg: Message, num: u32, mut pkgs: Vec<St
 			if x.starts_with("pkgs") {
 				nix_args.push(x);
 			} else {
-				nix_args.push(format!(
-					r#"pkgs.{x} or (undefined-variable.override {{ pname = "{x}"; }})"#
-				));
+				nix_args.push(
+					format!(
+						r#"if (lib.hasAttrByPath (lib.splitString "." "{x}") pkgs)
+						then (
+						 	if (
+								lib.meta.availableOn stdenv.buildPlatform pkgs.{x}
+								&& !pkgs.{x}.meta.broken
+								&& (builtins.tryEval pkgs.{x}.outPath).success
+							)
+							then pkgs.{x}
+							else null
+						) else undefined-variable.override {{ pname = "{x}"; }}"#
+					)
+					.replace('\n', ""),
+				);
 			}
 		}
 		let mut nix_output = Command::new("sudo")
