@@ -15,8 +15,9 @@ use anyhow::Context;
 use brace_expand::brace_expand;
 use bytes::Bytes;
 use frankenstein::{
-	AllowedUpdate, AsyncApi, AsyncTelegramApi, EditMessageTextParams, GetUpdatesParams, LinkPreviewOptions, Message,
-	ReplyParameters, SendMessageParams, UpdateContent,
+	AllowedUpdate, AsyncApi, AsyncTelegramApi, Chat, EditMessageTextParams, GetUpdatesParams, InlineKeyboardButton,
+	InlineKeyboardMarkup, LinkPreviewOptions, MaybeInaccessibleMessage, Message, ReplyMarkup, ReplyParameters,
+	SendMessageParams, UpdateContent,
 };
 use once_cell::sync::Lazy;
 use tokio::{
@@ -30,6 +31,7 @@ use zip::ZipArchive;
 static TASKS_RUNNING: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TASKS.get()));
 static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static PRS_BUILDING: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static PRS_OUTPATHS: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 static NIX_USER: Lazy<String> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_NIX_USER").unwrap_or("nobody".to_owned()));
@@ -73,6 +75,9 @@ static WASTEBIN_URL: Lazy<String> =
 	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_WASTEBIN").unwrap_or("https://paste.fliegendewurst.eu".to_owned()));
 static CONTACT: Lazy<String> =
 	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_CONTACT").unwrap_or("this bot's owner".to_owned()));
+static DESCRIPTION: Lazy<String> = Lazy::new(|| {
+	env::var("NIXPKGS_PR_BUILD_BOT_DESCRIPTION").unwrap_or("the nixpkgs revision currently checked out".to_owned())
+});
 static GH_TOKEN: Lazy<Option<String>> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_GH_TOKEN").ok());
 
 #[tokio::main]
@@ -82,6 +87,19 @@ async fn main() {
 			eprintln!("general error: {e:?}");
 		}
 		tokio::time::sleep(Duration::from_secs(10)).await;
+	}
+}
+
+trait MessageGetChat {
+	fn chat(&self) -> &Chat;
+}
+
+impl MessageGetChat for MaybeInaccessibleMessage {
+	fn chat(&self) -> &Chat {
+		match self {
+			MaybeInaccessibleMessage::Message(message) => &message.chat,
+			MaybeInaccessibleMessage::InaccessibleMessage(inaccessible_message) => &inaccessible_message.chat,
+		}
 	}
 }
 
@@ -114,7 +132,11 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 
 	// Fetch new updates via long poll method
 	let mut update_params = GetUpdatesParams::builder()
-		.allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MessageReaction])
+		.allowed_updates(vec![
+			AllowedUpdate::Message,
+			AllowedUpdate::MessageReaction,
+			AllowedUpdate::CallbackQuery,
+		])
 		.build();
 	let mut messages = HashMap::new();
 	loop {
@@ -127,6 +149,46 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 		let stream = stream.unwrap();
 		for update in stream.result {
 			update_params.offset = Some(i64::from(update.update_id) + 1);
+
+			// Handle inline keyboard presses.
+			if let UpdateContent::CallbackQuery(cb) = &update.content {
+				let Some(id) = cb.message.as_ref().map(|x| x.chat().id) else {
+					continue;
+				};
+				if let Some(num) = cb.data.as_ref().map(|x| x.parse().ok()).flatten() {
+					let out_paths = PRS_OUTPATHS.lock().await;
+					let Some(out_paths) = out_paths.get(&num) else {
+						continue;
+					};
+					if out_paths.len() <= 10 {
+						// send directly
+						let reply = format!("📝 Out paths for PR {num}\n{}", out_paths.join("\n"));
+						api.send_message(
+							&SendMessageParams::builder()
+								.chat_id(id)
+								.link_preview_options(LinkPreviewOptions::builder().is_disabled(true).build())
+								.text(reply)
+								.build(),
+						)
+						.await?;
+					} else {
+						let reply = format!(
+							"📝 Out paths for PR {num}\n👉 Full list: {}",
+							paste("PR #{num} - out paths", "", &out_paths.join("\n")).await?
+						);
+						api.send_message(
+							&SendMessageParams::builder()
+								.chat_id(id)
+								.link_preview_options(LinkPreviewOptions::builder().is_disabled(true).build())
+								.text(reply)
+								.build(),
+						)
+						.await?;
+					}
+				}
+				continue;
+			}
+
 			// If the received update contains a new message...
 			let mut message = if let UpdateContent::MessageReaction(reaction) = &update.content {
 				// TODO: use api.get_messages for older messages
@@ -173,8 +235,8 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 					"/start" => {
 						reply!(message, format!("This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
 You can also just send the PR as URL. Packages is a space seperated list of additional packages to build. You can exclude certain packages by prefixing them with -.
-PRs are tested by cherry-picking their commits on a somewhat recent master/staging merge, with strictDeps and PIE enabled by default, and all of my own PRs merged.
-Ping {} if you have trouble.", *CONTACT));
+PRs are tested by cherry-picking their commits on {}.
+Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 					},
 					"/pr" => {
 						let api = Arc::clone(&api);
@@ -219,7 +281,12 @@ Ping {} if you have trouble.", *CONTACT));
 							if !status.is_empty() {
 								status.push('\n');
 							}
-							status += &format!("PR {num}: {}", pkgs.join(" "));
+							let pkgs = if pkgs.len() <= 10 {
+								pkgs.join(" ")
+							} else {
+								format!("{} packages", pkgs.len())
+							};
+							status += &format!("PR {num}: {}", pkgs);
 						}
 						if !status.is_empty() {
 							reply!(message, status);
@@ -253,6 +320,24 @@ async fn process_pr(
 							.chat_id($msg.chat.id)
 							.build(),
 					)
+					.text($txt)
+					.build(),
+			)
+			.await
+			.context("sending reply")?
+			.result
+		};
+		($msg:expr, $txt:expr, $reply_markup:expr) => {
+			api.send_message(
+				&SendMessageParams::builder()
+					.chat_id($msg.chat.id)
+					.reply_parameters(
+						ReplyParameters::builder()
+							.message_id($msg.message_id)
+							.chat_id($msg.chat.id)
+							.build(),
+					)
+					.reply_markup($reply_markup)
 					.text($txt)
 					.build(),
 			)
@@ -483,11 +568,29 @@ async fn process_pr(
 			.stdout,
 	)
 	.unwrap();
+	let new_commit = String::from_utf8(
+		Command::new("jj")
+			.current_dir(&*NIXPKGS_DIRECTORY)
+			.args("new --message root --no-edit root()".split_whitespace())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()?
+			.wait_with_output()
+			.await
+			.context("running jj to create new commit")?
+			.stderr, // why is this printed to stderr ???
+	)
+	.unwrap();
+	let new_commit = new_commit
+		.split(' ')
+		.skip(4)
+		.next()
+		.context("failed to create new commit using jj")?;
 
 	let tmp = format!("/tmp/nixpkgs-{num}");
 	Command::new("git")
 		.current_dir(&*NIXPKGS_DIRECTORY)
-		.args(["worktree", "add", &tmp, &format!("{rev}~")])
+		.args(["worktree", "add", &tmp, new_commit])
 		.spawn()
 		.context("creating worktree with git")?
 		.wait()
@@ -537,6 +640,8 @@ async fn process_pr(
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("commit -a --message wip".split(' '))
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
 		.spawn()
 		.context("committing working copy with git")?
 		.wait()
@@ -676,7 +781,7 @@ async fn process_pr(
 			} else {
 				nix_args.push(
 					format!(
-						r#"if (lib.hasAttrByPath (lib.splitString "." "{x}") pkgs)
+						r#"if (lib.hasAttrByPath (lib.splitString "." "{x}.meta") pkgs)
 						then (
 						 	if (
 								lib.meta.availableOn stdenv.buildPlatform pkgs.{x}
@@ -711,18 +816,28 @@ async fn process_pr(
 		let nix_output = nix_output.wait_with_output().await?;
 		if nix_output.status.success() {
 			let stdout = String::from_utf8_lossy(&nix_output.stdout);
-			let built: Vec<&str> = stdout
-				.split(' ')
+			let built: Vec<&str> = stdout.split(' ').collect();
+			let mut out_paths = PRS_OUTPATHS.lock().await;
+			out_paths.insert(num, built.iter().map(|&x| x.to_owned()).collect());
+			drop(out_paths);
+			let built: Vec<_> = built
+				.into_iter()
 				// strip nix-store prefix
 				.map(|x| if x.len() > 44 { &x[44..] } else { x })
 				.map(|x| x.trim_ascii_end())
 				.collect();
-			let built_for_real = built
+			let mut built_for_real = built
 				.iter()
 				.filter(|x| !x.starts_with("undefined-variable"))
 				.copied()
 				.collect::<Vec<_>>()
 				.join(" ");
+			if built_for_real.len() > 1000 {
+				built_for_real = format!(
+					"{} packages",
+					built.iter().filter(|x| !x.starts_with("undefined-variable")).count()
+				);
+			}
 			let warn_undefined = built
 				.iter()
 				.flat_map(|x| x.strip_prefix("undefined-variable-"))
@@ -738,7 +853,18 @@ async fn process_pr(
 			if built_for_real.is_empty() {
 				reply!(msg, format!("❓ PR {num}, nothing built{extra}"));
 			} else {
-				reply!(msg, format!("✅ PR {num}, built {built_for_real}{extra}"));
+				let out_paths = InlineKeyboardButton::builder()
+					.text("📝 out paths")
+					.callback_data(format!("{num}"))
+					.build();
+				let open_pr = InlineKeyboardButton::builder()
+					.text("🌐 open PR")
+					.url(format!("https://github.com/NixOS/nixpkgs/pull/{num}"))
+					.build();
+				let keyboard = vec![vec![out_paths, open_pr]];
+				let inline = InlineKeyboardMarkup::builder().inline_keyboard(keyboard).build();
+				let markup = ReplyMarkup::InlineKeyboardMarkup(inline);
+				reply!(msg, format!("✅ PR {num}, built {built_for_real}{extra}"), markup);
 			}
 		} else {
 			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);

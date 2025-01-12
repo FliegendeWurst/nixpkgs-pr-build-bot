@@ -24,7 +24,8 @@ export NIXPKGS_PR_BUILD_BOT_CORES=0
 export NIXPKGS_PR_BUILD_BOT_JOBS=6
 export NIXPKGS_PR_BUILD_BOT_TASKS=10
 export NIXPKGS_PR_BUILD_BOT_WASTEBIN=https://paste.fliegendewurst.eu
-export NIXPKGS_PR_BUILD_BOT_CONTACT=this bot's owner
+export NIXPKGS_PR_BUILD_BOT_CONTACT="this bot's owner"
+export NIXPKGS_PR_BUILD_BOT_DESCRIPTION="the nixpkgs revision currently checked out"
 export NIXPKGS_PR_BUILD_BOT_GH_TOKEN=
 ```
 
