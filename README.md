@@ -3,6 +3,8 @@
 This bot is essentially a private [ofborg](https://github.com/NixOS/ofborg?tab=readme-ov-file#ofborg) / [nixpkgs-review](https://github.com/Mic92/nixpkgs-review) bot, but much easier to host.
 It builds all packages mentioned in the commits of a nixpkgs pull request, or alternatively all packages impacted by the changes.
 
+Send me a message if you would like to access a demo instance of the bot.
+
 ## Configuration
 
 You can configure the bot by setting certain environment variables.
