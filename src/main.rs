@@ -792,7 +792,11 @@ async fn process_pr(
 							else null
 						) else undefined-variable.override {{ pname = "{x}"; }}"#
 					)
-					.replace('\n', ""),
+					.replace('\n', "")
+					.replace("     ", " ")
+					.replace("    ", " ")
+					.replace("   ", " ")
+					.replace("  ", " "),
 				);
 			}
 		}
