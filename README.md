@@ -1,6 +1,6 @@
-# nixpkgs PR build bot
+<img align="right" src="https://github.com/user-attachments/assets/0661ad84-7fdb-4d71-b39f-fb4b2c65510e">
 
-<img align="right" src="https://github.com/user-attachments/assets/0de07591-e58f-4567-9693-23f0333edf85">
+# nixpkgs PR build bot
 
 This bot is essentially a private [ofborg](https://github.com/NixOS/ofborg?tab=readme-ov-file#ofborg) / [nixpkgs-review](https://github.com/Mic92/nixpkgs-review) bot, but much easier to host.
 It builds all packages mentioned in the commits of a nixpkgs pull request, or alternatively all packages impacted by the changes.
