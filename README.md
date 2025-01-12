@@ -1,6 +1,6 @@
-<img align="right" src="https://github.com/user-attachments/assets/0661ad84-7fdb-4d71-b39f-fb4b2c65510e">
-
 # nixpkgs PR build bot
+
+<img align="right" src="https://github.com/user-attachments/assets/0661ad84-7fdb-4d71-b39f-fb4b2c65510e">
 
 This bot is essentially a private [ofborg](https://github.com/NixOS/ofborg?tab=readme-ov-file#ofborg) / [nixpkgs-review](https://github.com/Mic92/nixpkgs-review) bot, but much easier to host.
 It builds all packages mentioned in the commits of a nixpkgs pull request, or alternatively all packages impacted by the changes.
@@ -15,7 +15,7 @@ The bot will process `$TASKS` PRs in parallel, with `$JOBS` jobs each, with each
 `$SUDO_PASSWORD` is used to switch to the `nobody` user when invoking Nix.
 `$WASTEBIN` is the URL to a [wastebin](https://github.com/matze/wastebin) instance.
 (Note, the instance must support [setting paste titles](https://github.com/matze/wastebin/pull/91).)
-`$CONTACT` is displayed in the bot's introduction message.
+`$CONTACT`, `$DESCRIPTION` are displayed in the bot's introduction message.
 `$GH_TOKEN` is only used for fetching evaluation artifacts, use a fine-grained access token with public read-only permissions.
 
 `.env` template, with the defaults explicitly set:
