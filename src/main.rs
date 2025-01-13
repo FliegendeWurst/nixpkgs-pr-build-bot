@@ -20,6 +20,7 @@ use frankenstein::{
 	SendMessageParams, UpdateContent,
 };
 use once_cell::sync::Lazy;
+use sysinfo::Disks;
 use tokio::{
 	io::AsyncWriteExt,
 	process::Command,
@@ -104,6 +105,12 @@ impl MessageGetChat for MaybeInaccessibleMessage {
 }
 
 async fn real_main() -> Result<(), Box<dyn Error>> {
+	let disks = Disks::new_with_refreshed_list();
+	let biggest_disk = disks
+		.iter()
+		.max_by_key(|x| x.total_space())
+		.expect("failed to detect /nix/store disk");
+
 	let token = env::var("TELEGRAM_BOT_TOKEN").expect("TELEGRAM_BOT_TOKEN not set");
 	Lazy::force(&NIX_USER);
 	Lazy::force(&SUDO_PASSWORD);
@@ -147,7 +154,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 			continue;
 		}
 		let stream = stream.unwrap();
-		for update in stream.result {
+		'update: for update in stream.result {
 			update_params.offset = Some(i64::from(update.update_id) + 1);
 
 			// Handle inline keyboard presses.
@@ -239,6 +246,10 @@ PRs are tested by cherry-picking their commits on {}.
 Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 					},
 					"/pr" => {
+						if biggest_disk.available_space() < 200_000_000_000 {
+							reply!(message, "🫠 Internal error: out of disk space");
+							continue 'update;
+						}
 						let api = Arc::clone(&api);
 						let message = message.clone();
 						task::spawn(async move {
