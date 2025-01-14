@@ -956,7 +956,16 @@ async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<String
 				None
 			},
 		)
-		.map(|x| {
+		.map(|mut x| {
+			let full_logs: Vec<_> = x
+				.iter()
+				.enumerate()
+				.filter(|x| x.1.contains("For full logs, run"))
+				.collect();
+			if full_logs.len() >= 2 {
+				// very short build log
+				x = x[full_logs[full_logs.len() - 2].0 + 1..].to_vec();
+			}
 			x.into_iter()
 				.flat_map(|x| {
 					// indent is different depending on top-level vs. dependency fail
