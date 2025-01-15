@@ -804,6 +804,7 @@ async fn process_pr(
 						) else undefined-variable.override {{ pname = "{x}"; }}"#
 					)
 					.replace('\n', "")
+					.replace('\t', " ")
 					.replace("     ", " ")
 					.replace("    ", " ")
 					.replace("   ", " ")
