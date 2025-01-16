@@ -19,9 +19,11 @@ use frankenstein::{
 	InlineKeyboardMarkup, LinkPreviewOptions, MaybeInaccessibleMessage, Message, ReplyMarkup, ReplyParameters,
 	SendMessageParams, UpdateContent,
 };
+use itertools::Itertools;
 use once_cell::sync::Lazy;
 use sysinfo::Disks;
 use tokio::{
+	fs,
 	io::AsyncWriteExt,
 	process::Command,
 	sync::{Mutex, Semaphore},
@@ -34,6 +36,7 @@ static PRS_RUNNING: Lazy<Mutex<HashSet<u32>>> = Lazy::new(|| Mutex::new(HashSet:
 static PRS_BUILDING: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static PRS_OUTPATHS: Lazy<Mutex<HashMap<u32, Vec<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static GIT_OPERATIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static CONFIG: Lazy<Mutex<HashMap<u64, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 static NIX_USER: Lazy<String> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_NIX_USER").unwrap_or("nobody".to_owned()));
 static SUDO_PASSWORD: Lazy<String> = Lazy::new(|| {
@@ -80,6 +83,9 @@ static DESCRIPTION: Lazy<String> = Lazy::new(|| {
 	env::var("NIXPKGS_PR_BUILD_BOT_DESCRIPTION").unwrap_or("the nixpkgs revision currently checked out".to_owned())
 });
 static GH_TOKEN: Lazy<Option<String>> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_GH_TOKEN").ok());
+static CONFIG_FILE: Lazy<Option<String>> = Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_CONFIG").ok());
+static CROSS: Lazy<String> =
+	Lazy::new(|| env::var("NIXPKGS_PR_BUILD_BOT_CROSS").unwrap_or("aarch64-multiplatform".to_owned()));
 
 #[tokio::main]
 async fn main() {
@@ -121,8 +127,20 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&WASTEBIN_URL);
 	Lazy::force(&CONTACT);
 	Lazy::force(&GH_TOKEN);
+	Lazy::force(&CONFIG_FILE);
+	Lazy::force(&CROSS);
 	let api = AsyncApi::new(&token);
 	let api = Arc::new(api);
+
+	if let Some(path) = CONFIG_FILE.as_ref() {
+		let mut config = CONFIG.lock().await;
+		let content = fs::read_to_string(path).await.unwrap_or_default();
+		for line in content.split('\n').filter(|x| x.contains('=')) {
+			let (id, setting) = line.split_once('=').unwrap();
+			let id = id.parse::<u64>()?;
+			config.insert(id, setting.to_owned());
+		}
+	}
 
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
@@ -226,12 +244,17 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 				let args = args.to_owned();
 
 				// Print received text message to stdout.
+				let id = message.from.as_ref().map(|x| x.id).unwrap_or(0);
 				println!(
 					"<{} {:?}>: {}",
-					message.from.as_ref().map(|x| x.id).unwrap_or(0),
+					id,
 					&message.from.as_ref().map(|x| x.first_name.clone()).unwrap_or_default(),
 					data
 				);
+				let cross = {
+					let config = CONFIG.lock().await;
+					config.get(&id).map(|x| x.contains("cross")).unwrap_or(false)
+				};
 
 				let full = command.to_ascii_lowercase() == "/full";
 				if full {
@@ -239,6 +262,21 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 				}
 
 				match &*command.to_ascii_lowercase() {
+					"/cross" => {
+						let mut config = CONFIG.lock().await;
+						let config_str = config.entry(id).or_default();
+						let new = if config_str.contains("cross") {
+							*config_str = config_str.replace("cross", "");
+							false
+						} else {
+							*config_str += "cross";
+							true
+						};
+						reply!(message, format!("🔀 Auto-cross: {new:?}"));
+						if let Some(path) = CONFIG_FILE.as_ref() {
+							fs::write(path, config.iter().map(|x| format!("{}={}", x.0, x.1)).join("\n")).await?;
+						}
+					},
 					"/start" => {
 						reply!(message, format!("This bot allows you to build nixpkgs PRs.\nUsage: /pr <number> <packages> -<exclude packages>
 You can also just send the PR as URL. Packages is a space seperated list of additional packages to build. You can exclude certain packages by prefixing them with -.
@@ -266,7 +304,7 @@ Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 							if num == 0 {
 								return;
 							}
-							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs, full).await {
+							if let Err(e) = process_pr(Arc::clone(&api), message, num, pkgs, full, cross).await {
 								println!("error: {:?}", e);
 								let _ = api
 									.send_message(
@@ -319,6 +357,7 @@ async fn process_pr(
 	num: u32,
 	mut pkgs: Vec<String>,
 	full: bool,
+	cross: bool,
 ) -> Result<(), anyhow::Error> {
 	macro_rules! reply {
 		($msg:expr, $txt:expr) => {
@@ -754,6 +793,14 @@ async fn process_pr(
 		pkgs.remove_item(pkg);
 	}
 	pkgs.retain(|x| !x.starts_with('-'));
+
+	if cross {
+		let cross_pkgs: Vec<_> = pkgs
+			.iter()
+			.flat_map(|x| (!x.starts_with("pkgs")).then(|| format!("pkgsCross.{}.{x}", *CROSS)))
+			.collect();
+		pkgs.extend_from_slice(&cross_pkgs);
+	}
 
 	let pkgs_to_build = pkgs.join(" ");
 	let mut prs_building = PRS_BUILDING.lock().await;
