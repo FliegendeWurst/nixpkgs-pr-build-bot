@@ -199,7 +199,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 					} else {
 						let reply = format!(
 							"📝 Out paths for PR {num}\n👉 Full list: {}",
-							paste("PR #{num} - out paths", "", &out_paths.join("\n")).await?
+							paste(&format!("PR #{num} - out paths"), "", &out_paths.join("\n")).await?
 						);
 						api.send_message(
 							&SendMessageParams::builder()
@@ -834,30 +834,27 @@ async fn process_pr(
 		}
 		nix_args.push("-p".to_owned());
 		for x in pkgs {
-			if x.starts_with("pkgs") {
-				nix_args.push(x);
-			} else {
-				nix_args.push(
-					format!(
-						r#"if (lib.hasAttrByPath (lib.splitString "." "{x}.meta") pkgs)
-						then (
-						 	if (
-								lib.meta.availableOn stdenv.buildPlatform pkgs.{x}
-								&& !pkgs.{x}.meta.broken
-								&& (builtins.tryEval pkgs.{x}.outPath).success
-							)
-							then pkgs.{x}
-							else null
-						) else undefined-variable.override {{ pname = "{x}"; }}"#
-					)
-					.replace('\n', "")
-					.replace('\t', " ")
-					.replace("     ", " ")
-					.replace("    ", " ")
-					.replace("   ", " ")
-					.replace("  ", " "),
-				);
-			}
+			let name = x.split_once(".override").unwrap_or((&x, "")).0;
+			nix_args.push(
+				format!(
+					r#"if (lib.hasAttrByPath (lib.splitString "." "{name}.meta") pkgs)
+					then (
+					 	if (
+							lib.meta.availableOn stdenv.buildPlatform (pkgs.{x})
+							&& !(pkgs.{x}).meta.broken
+							&& (builtins.tryEval (pkgs.{x}).outPath).success
+						)
+						then (pkgs.{x})
+						else null
+					) else undefined-variable.override {{ pname = "{name}"; }}"#
+				)
+				.replace('\n', "")
+				.replace('\t', " ")
+				.replace("     ", " ")
+				.replace("    ", " ")
+				.replace("   ", " ")
+				.replace("  ", " "),
+			);
 		}
 		let mut nix_output = Command::new("sudo")
 			.current_dir(&tmp)
@@ -980,8 +977,9 @@ impl<T: PartialEq<U>, U> VecRemoveItem<T, U> for Vec<T> {
 }
 
 async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<String, anyhow::Error> {
+	let oom = text.contains("No space left on device");
 	let mut map = serde_json::json!({
-		"title": title,
+		"title": if !oom { title.to_owned() } else { format!("{title} - likely out of /tmp space") },
 		"extension": "log",
 		"expires": 7 * 24 * 60 * 60
 	});
