@@ -1,4 +1,4 @@
-#![feature(round_char_boundary, iter_map_windows)]
+#![feature(round_char_boundary, iter_map_windows, exit_status_error)]
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -645,7 +645,8 @@ async fn process_pr(
 		.context("creating worktree with git")?
 		.wait()
 		.await
-		.context("creating worktree with git")?;
+		.map(|x| x.exit_ok().context("non-zero git worktree exit code"))
+		.context("creating worktree with git")??;
 
 	Command::new("git")
 		.current_dir(&tmp)
@@ -654,7 +655,8 @@ async fn process_pr(
 		.context("fetching upstream with git")?
 		.wait()
 		.await
-		.context("fetching upstream with git")?;
+		.map(|x| x.exit_ok().context("non-zero git fetch exit code"))
+		.context("fetching upstream with git")??;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["fetch", "origin", &format!("pull/{num}/head")])
@@ -662,7 +664,8 @@ async fn process_pr(
 		.context("fetching PR HEAD with git")?
 		.wait()
 		.await
-		.context("fetching PR HEAD with git")?;
+		.map(|x| x.exit_ok().context("non-zero git fetch exit code"))
+		.context("fetching PR HEAD with git")??;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["switch", "-C", &format!("nixpkgs-{num}")])
@@ -670,7 +673,8 @@ async fn process_pr(
 		.context("switching to new branch with git")?
 		.wait()
 		.await
-		.context("switching to new branch with git")?;
+		.map(|x| x.exit_ok().context("non-zero git switch exit code"))
+		.context("switching to new branch with git")??;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args(["restore", "-s", &rev, "--", "."])
@@ -678,7 +682,8 @@ async fn process_pr(
 		.context("restoring working copy with git")?
 		.wait()
 		.await
-		.context("restoring working copy with git")?;
+		.map(|x| x.exit_ok().context("non-zero git restore exit code"))
+		.context("restoring working copy with git")??;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("add .".split(' '))
@@ -686,7 +691,8 @@ async fn process_pr(
 		.context("adding working copy with git")?
 		.wait()
 		.await
-		.context("restoring working copy with git")?;
+		.map(|x| x.exit_ok().context("non-zero git add exit code"))
+		.context("restoring working copy with git")??;
 	Command::new("git")
 		.current_dir(&tmp)
 		.args("commit -a --message wip".split(' '))
@@ -696,7 +702,8 @@ async fn process_pr(
 		.context("committing working copy with git")?
 		.wait()
 		.await
-		.context("committing working copy with git")?;
+		.map(|x| x.exit_ok().context("non-zero git commit exit code"))
+		.context("committing working copy with git")??;
 	let output = Command::new("git")
 		.current_dir(&tmp)
 		.args("log --oneline FETCH_HEAD --not origin/master origin/staging origin/staging-next".split(' '))
@@ -705,7 +712,8 @@ async fn process_pr(
 		.context("getting new commits in PR with git")?
 		.wait_with_output()
 		.await
-		.context("getting new commits in PR with git")?;
+		.map(|x| x.status.exit_ok().map(|_| x).context("non-zero git log exit code"))
+		.context("getting new commits in PR with git")??;
 	let out = String::from_utf8(output.stdout)?;
 	let mut lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
 	lines.reverse();
