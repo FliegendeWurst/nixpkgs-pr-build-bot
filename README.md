@@ -37,6 +37,37 @@ export NIXPKGS_PR_BUILD_BOT_CONFIG=
 export NIXPKGS_PR_BUILD_BOT_CROSS=aarch64-multiplatform
 ```
 
+### NixOS config
+
+Adapt path to `.env`, host platform and user.
+```
+systemd.services.prBuildBot = {
+  description = "nixpkgs PR build bot";
+  script = ''
+    export PATH="$PATH:/run/wrappers/bin"
+    jj --version
+    git --version
+    nix-shell --version
+    sudo --version
+    source .../path/to/.env
+    exec ${lib.getExe nixpkgs-pr-build-bot.packages.x86_64-linux.nixpkgs-pr-build-bot}
+  '';
+  serviceConfig = {
+    User = "xxx";
+    Type = "simple";
+    OOMPolicy = "continue";
+  };
+  path = with pkgs; [
+    jujutsu
+    git
+    pkgs.nix
+  ];
+  wants = [ "network-online.target" ];
+  wantedBy = [ "network-online.target" ];
+  after = [ "network-online.target" ];
+};
+```
+
 ## Usage
 
 Start a chat with the bot. The bot will reply with a small introduction.
