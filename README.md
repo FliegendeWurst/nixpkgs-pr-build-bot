@@ -14,7 +14,6 @@ The bot will process `$TASKS` PRs in parallel, with `$JOBS` jobs each, with each
 `$NIXPKGS_DIRECTORY` must be set to a [jj](https://github.com/jj-vcs/jj#readme)-colocated checkout of nixpkgs.
 `$SUDO_PASSWORD` is used to switch to the `nobody` user when invoking Nix.
 `$WASTEBIN` is the URL to a [wastebin](https://github.com/matze/wastebin) instance.
-(Note, the instance must support [setting paste titles](https://github.com/matze/wastebin/pull/91).)
 `$CONTACT`, `$DESCRIPTION` are displayed in the bot's introduction message.
 `$GH_TOKEN` is only used for fetching evaluation artifacts, use a fine-grained access token with public read-only permissions.
 `$CONFIG` is where certain settings are stored, if not set those features don't work.
