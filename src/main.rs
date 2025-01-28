@@ -832,6 +832,7 @@ async fn process_pr(
 			NIX_USER.clone(),
 			"--preserve-env=NIXPKGS_ALLOW_UNFREE,NIXPKGS_ALLOW_INSECURE".to_owned(),
 			"nix-shell".to_owned(),
+			"--show-trace".to_owned(),
 			"--run".to_owned(),
 			"sh -c 'echo $buildInputs'".to_owned(),
 			"-k".to_owned(),
