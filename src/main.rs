@@ -849,11 +849,11 @@ async fn process_pr(
 			let name = x.split_once(".override").unwrap_or((&x, "")).0;
 			nix_args.push(
 				format!(
-					r#"if (lib.hasAttrByPath (lib.splitString "." "{name}.meta") pkgs)
+					r#"if (builtins.tryEval (lib.hasAttrByPath (lib.splitString "." "{name}") pkgs)).value
 					then (
 					 	if (
-							lib.meta.availableOn stdenv.buildPlatform (pkgs.{x})
-							&& !(pkgs.{x}).meta.broken
+							(builtins.tryEval (lib.meta.availableOn stdenv.buildPlatform (pkgs.{x}))).value
+							&& (builtins.tryEval (!(pkgs.{x}).meta.broken)).value
 							&& (builtins.tryEval (pkgs.{x}).outPath).success
 						)
 						then (pkgs.{x})
