@@ -132,7 +132,11 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&GH_TOKEN);
 	Lazy::force(&CONFIG_FILE);
 	Lazy::force(&CROSS);
-	let api = AsyncApi::new(&token);
+	let mut api = AsyncApi::new(&token);
+	api.client = reqwest::ClientBuilder::new()
+		.connect_timeout(std::time::Duration::from_secs(30))
+		.timeout(std::time::Duration::from_secs(500))
+		.build()?;
 	let api = Arc::new(api);
 
 	if let Some(path) = CONFIG_FILE.as_ref() {
@@ -294,6 +298,7 @@ Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 						let api = Arc::clone(&api);
 						let message = message.clone();
 						task::spawn(async move {
+							let message_id = message.message_id;
 							let id = message.chat.id;
 							let (num, pkgs) = if args.contains(' ') {
 								let (num, pkgs) = args.split_once(' ').unwrap();
@@ -314,6 +319,9 @@ Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 										&SendMessageParams::builder()
 											.chat_id(id)
 											.text(format!("🤯 Internal error: {e:?}"))
+											.reply_parameters(
+												ReplyParameters::builder().message_id(message_id).chat_id(id).build(),
+											)
 											.build(),
 									)
 									.await;
