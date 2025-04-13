@@ -66,11 +66,16 @@ pub async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<St
 				*line_orig += "\n";
 				*line_orig += line;
 			}
-			*line_orig += "\n";
+			*line_orig += "\n\n\n";
 		} else if !s.is_empty() {
-			*line_orig += "\n";
-			*line_orig += s.trim_end();
-			*line_orig += "\n";
+			for line in s.lines() {
+				if line.is_empty() || line.trim_ascii().is_empty() {
+					continue;
+				}
+				*line_orig += "\n";
+				*line_orig += line;
+			}
+			*line_orig += "\n\n\n";
 		}
 	}
 	if text.len() >= 5 * 1000 * 1000 {
