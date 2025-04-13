@@ -14,44 +14,9 @@ pub async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<St
 	let lines = text.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
 	let mut failures = lines
 		.iter()
-		.copied()
-		.map_windows(|x: &[&str; 26]| {
-			if x[25].contains("For full logs, run") {
-				Some(x.to_vec())
-			} else {
-				None
-			}
-		})
-		.flatten()
-		.chain(
-			if lines.len() < 26 && lines.last().unwrap().contains("For full logs, run") {
-				Some(lines.clone())
-			} else {
-				None
-			},
-		)
-		.map(|mut x| {
-			let full_logs: Vec<_> = x
-				.iter()
-				.enumerate()
-				.filter(|x| x.1.contains("For full logs, run"))
-				.collect();
-			if full_logs.len() >= 2 {
-				// very short build log
-				x = x[full_logs[full_logs.len() - 2].0 + 1..].to_vec();
-			}
-			x.into_iter()
-				.flat_map(|x| {
-					// indent is different depending on top-level vs. dependency fail
-					x.strip_prefix("       > ")
-						.or(x.strip_prefix("      > "))
-						.or(x.strip_prefix("       For full logs, run "))
-						.or(x.strip_prefix("      For full logs, run "))
-				})
-				.chain(Some("\n"))
-		})
-		.flatten()
-		.map(|x| x.to_owned())
+		.filter_map(|x| x.strip_prefix("error: builder for '"))
+		.map(|x| x.split('\'').next().unwrap())
+		.map(|drv| format!("'nix log {drv}'."))
 		.collect::<Vec<_>>();
 	failures.extend(
 		lines
