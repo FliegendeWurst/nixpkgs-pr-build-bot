@@ -15,7 +15,7 @@ pub async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<St
 	let mut failures = lines
 		.iter()
 		.filter_map(|x| x.strip_prefix("error: builder for '"))
-		.map(|x| x.split('\'').next().unwrap())
+		.filter_map(|x| x.split("\' failed with exit code").next())
 		.map(|drv| format!("'nix log {drv}'."))
 		.collect::<Vec<_>>();
 	failures.extend(
@@ -58,6 +58,15 @@ pub async fn paste(title: &str, title_prefix: &str, mut text: &str) -> Result<St
 		line_orig.pop();
 		*line_orig += ": ";
 		*line_orig += &url;
+		if let Some(last_lines) = s.lines().map_windows(|x: &[&str; 25]| *x).last() {
+			for line in last_lines {
+				*line_orig += "\n";
+				*line_orig += line;
+			}
+		} else if !s.is_empty() {
+			*line_orig += "\n";
+			*line_orig += s.trim_end();
+		}
 	}
 	if text.len() >= 5 * 1000 * 1000 {
 		// truncate
