@@ -14,11 +14,9 @@ use std::{
 use anyhow::Context;
 use brace_expand::brace_expand;
 use bytes::Bytes;
-use frankenstein::{
-	AllowedUpdate, AsyncApi, AsyncTelegramApi, Chat, EditMessageTextParams, GetUpdatesParams, InlineKeyboardButton,
-	InlineKeyboardMarkup, LinkPreviewOptions, MaybeInaccessibleMessage, Message, ReplyMarkup, ReplyParameters,
-	SendMessageParams, UpdateContent,
-};
+use frankenstein::methods::*;
+use frankenstein::types::*;
+use frankenstein::{client_reqwest::Bot, updates::UpdateContent, AsyncTelegramApi};
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use sysinfo::Disks;
@@ -132,7 +130,7 @@ async fn real_main() -> Result<(), Box<dyn Error>> {
 	Lazy::force(&GH_TOKEN);
 	Lazy::force(&CONFIG_FILE);
 	Lazy::force(&CROSS);
-	let mut api = AsyncApi::new(&token);
+	let mut api = Bot::new(&token);
 	api.client = reqwest::ClientBuilder::new()
 		.connect_timeout(std::time::Duration::from_secs(30))
 		.timeout(std::time::Duration::from_secs(500))
@@ -363,7 +361,7 @@ Ping {} if you have trouble.", *DESCRIPTION, *CONTACT));
 }
 
 async fn process_pr(
-	api: Arc<AsyncApi>,
+	api: Arc<Bot>,
 	msg: Message,
 	num: u32,
 	mut pkgs: Vec<String>,
