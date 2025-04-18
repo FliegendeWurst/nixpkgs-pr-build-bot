@@ -855,7 +855,7 @@ async fn process_pr(
 			let name = x.split_once(".override").unwrap_or((&x, "")).0;
 			nix_args.push(
 				format!(
-					r#"if (builtins.tryEval (lib.hasAttrByPath (lib.splitString "." "{name}") pkgs)).value
+					r#"if (builtins.tryEval (lib.hasAttrByPath ((lib.splitString "." "{name}") ++ ["meta"]) pkgs)).value
 					then (
 					 	if (
 							(builtins.tryEval (lib.meta.availableOn stdenv.buildPlatform (pkgs.{x}))).value
@@ -947,7 +947,7 @@ async fn process_pr(
 		} else {
 			let stripped = strip_ansi_escapes::strip(&nix_output.stderr);
 			let stdout = String::from_utf8_lossy(&stripped);
-			if stdout.split('\n').skip(10).next().is_none() {
+			if stdout.split('\n').skip(10).next().is_none() && stdout.len() < 1500 {
 				reply!(msg, format!("💥 PR {num}, build failed"));
 				reply!(msg, stdout);
 			} else {
