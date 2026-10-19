@@ -446,8 +446,14 @@ async fn process_pr(
 	let my_msg = reply!(msg, &msg_text);
 	macro_rules! extend_message {
 		($new_text:expr) => {{
+			let x = $new_text;
+			let x = if x.len() > 1000 {
+				&x[0..x.floor_char_boundary(1000)]
+			} else {
+				&x
+			};
 			msg_text.push('\n');
-			msg_text += &($new_text);
+			msg_text += x;
 			api.edit_message_text(
 				&EditMessageTextParams::builder()
 					.chat_id(msg.chat.id)
