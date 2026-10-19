@@ -1,4 +1,4 @@
-#![feature(round_char_boundary, iter_map_windows, exit_status_error)]
+#![feature(iter_map_windows, exit_status_error)]
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -445,7 +445,7 @@ async fn process_pr(
 	let mut msg_text = format!("⏳ PR {num}, fetching ...");
 	let my_msg = reply!(msg, &msg_text);
 	macro_rules! extend_message {
-		($new_text:expr) => {
+		($new_text:expr) => {{
 			msg_text.push('\n');
 			msg_text += &($new_text);
 			api.edit_message_text(
@@ -456,8 +456,8 @@ async fn process_pr(
 					.build(),
 			)
 			.await
-			.context("editing response")?;
-		};
+			.context("editing response")
+		}};
 	}
 
 	'eval: {
@@ -466,11 +466,11 @@ async fn process_pr(
 			break 'eval;
 		}
 		let Some(token) = GH_TOKEN.as_ref() else {
-			extend_message!("⚠️ no GH token configured");
+			extend_message!("⚠️ no GH token configured")?;
 			break 'eval;
 		};
 		let Some(commit_sha) = json.pointer("/head/sha").map(|x| x.as_str()).flatten() else {
-			extend_message!("⚠️ could not fetch PR HEAD");
+			extend_message!("⚠️ could not fetch PR HEAD")?;
 			break 'eval;
 		};
 		let workflow_runs_resp: serde_json::Value = api
@@ -497,7 +497,7 @@ async fn process_pr(
 			.map(|x| x.as_array())
 			.flatten()
 		else {
-			extend_message!("⚠️ no workflow runs found");
+			extend_message!("⚠️ no workflow runs found")?;
 			break 'eval;
 		};
 
@@ -506,12 +506,12 @@ async fn process_pr(
 			.filter(|x| x.pointer("/name").map(|x| x.as_str()).flatten() == Some("Eval"))
 			.next()
 		else {
-			extend_message!("⚠️ no eval run found");
+			extend_message!("⚠️ no eval run found")?;
 			break 'eval;
 		};
 
 		let Some(artifacts_url) = run.pointer("/artifacts_url").map(|x| x.as_str()).flatten() else {
-			extend_message!("⚠️ no eval artifact found (wait for eval to complete)");
+			extend_message!("⚠️ no eval artifact found (wait for eval to complete)")?;
 			break 'eval;
 		};
 
@@ -539,7 +539,7 @@ async fn process_pr(
 			})
 			.flatten()
 		else {
-			extend_message!("⚠️ eval artifact not found");
+			extend_message!("⚠️ eval artifact not found")?;
 			break 'eval;
 		};
 		let Some(artifact_id) = artifacts
@@ -549,7 +549,7 @@ async fn process_pr(
 			.next()
 			.flatten()
 		else {
-			extend_message!("⚠️ artifact ID not found");
+			extend_message!("⚠️ artifact ID not found")?;
 			break 'eval;
 		};
 		let zip_url = format!("https://api.github.com/repos/NixOS/nixpkgs/actions/artifacts/{artifact_id}/zip");
@@ -583,7 +583,7 @@ async fn process_pr(
 		println!("{changed_paths:?}");
 
 		let Some(added) = changed_paths.pointer("/attrdiff/added").map(|x| x.as_array()).flatten() else {
-			extend_message!("⚠️ added packages not found");
+			extend_message!("⚠️ added packages not found")?;
 			break 'eval;
 		};
 		let Some(changed) = changed_paths
@@ -591,7 +591,7 @@ async fn process_pr(
 			.map(|x| x.as_array())
 			.flatten()
 		else {
-			extend_message!("⚠️ changed packages not found");
+			extend_message!("⚠️ changed packages not found")?;
 			break 'eval;
 		};
 		for x in added.into_iter().chain(changed.into_iter()).flat_map(|x| x.as_str()) {
@@ -727,7 +727,7 @@ async fn process_pr(
 	let mut lines = out.split('\n').filter(|x| !x.is_empty()).collect::<Vec<_>>();
 	lines.reverse();
 	println!("PR {num}, changes:\n{}", lines.join("\n"));
-	extend_message!(format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
+	let _ = extend_message!(format!("⏳ PR {num}, changes:\n{}", lines.join("\n")));
 	let mut doit = true;
 	let mut warn_merge = false;
 	for line in &lines {
@@ -830,7 +830,7 @@ async fn process_pr(
 		pkgs_to_build
 	};
 	if doit {
-		extend_message!(format!("⏳ PR {num}, building: {pkgs_to_build}"));
+		extend_message!(format!("⏳ PR {num}, building: {pkgs_to_build}"))?;
 
 		let mut nix_args = vec![
 			"-S".to_owned(),
